@@ -1143,3 +1143,151 @@ An **SLI** is a measured ratio of good events, e.g. "requests under 500 ms and n
 </details>
 
 
+
+## 12 — Async, scheduling & Batch
+
+_From [notes/12-async-batch/async-scheduling-batch.md](12-async-batch/async-scheduling-batch.md)_
+
+
+<details><summary>Q1. How does @Async work under the hood?</summary>
+
+`@EnableAsync` registers `AsyncAnnotationBeanPostProcessor`. In `postProcessAfterInitialization`, it wraps beans that have `@Async` methods in a proxy whose advice is `AnnotationAsyncExecutionInterceptor`. On a call, the interceptor resolves an executor and submits the invocation as a `Callable`:
+1. the `@Async` qualifier;
+2. otherwise `AsyncConfigurer.getAsyncExecutor()`;
+3. otherwise a unique `TaskExecutor` bean;
+4. otherwise a bean named `taskExecutor`;
+5. otherwise a new `SimpleAsyncTaskExecutor`, a fresh thread per call (proven by `withoutAnyExecutorBean_asyncFallsBackToSimpleAsyncTaskExecutor_aNewThreadPerCall`).
+
+It then returns immediately: a future for `Future`/`CompletableFuture` methods, or nothing for `void`. Because it's proxy-based, self-invocation, `private` methods and calls from `@PostConstruct` are not async.
+</details>
+
+<details><summary>Q2. What happens to an exception thrown in an @Async method?</summary>
+
+If the method returns `CompletableFuture`/`Future`, the exception completes the future exceptionally. `get()` throws `ExecutionException`, `join()` throws `CompletionException`, and you can recover with `exceptionally`/`handle`. If the method is `void`, nobody can receive it, so it goes to the `AsyncUncaughtExceptionHandler`. The default `SimpleAsyncUncaughtExceptionHandler` only logs it. Register your own via `AsyncConfigurer.getAsyncUncaughtExceptionHandler()` to count, alert or dead-letter.
+</details>
+
+<details><summary>Q3. Does @Transactional or the SecurityContext propagate into an @Async method?</summary>
+
+No. Both are bound to the thread through `ThreadLocal`s (`TransactionSynchronizationManager`, `SecurityContextHolder`). The async method runs outside the caller's transaction and can't see its uncommitted rows. If it's `@Transactional` itself, it starts its own. For security, use `DelegatingSecurityContextAsyncTaskExecutor` or a `TaskDecorator` that wraps with `DelegatingSecurityContextRunnable`. For "do X after the save", use `@TransactionalEventListener(AFTER_COMMIT)` with `@Async`.
+</details>
+
+<details><summary>Q4. What is a TaskDecorator and when do you need one?</summary>
+
+It's a hook on an executor that wraps every submitted `Runnable`. `decorate()` runs on the submitting thread, so it can snapshot `ThreadLocal` state (MDC, security, locale, tenant) and restore it on the worker thread around `run()`. It should restore the worker's previous state afterwards, not just clear it, because with `CallerRunsPolicy` the worker can be the caller. Boot applies `TaskDecorator` beans to its auto-configured executor and scheduler, combining several into a `CompositeTaskDecorator` in Boot 4. You must set it yourself on executors you build. `spring.task.execution.propagate-context=true` adds Micrometer's `ContextPropagatingTaskDecorator`.
+</details>
+
+<details><summary>Q5. fixedRate vs fixedDelay vs cron? Can a scheduled task overlap with itself?</summary>
+
+- `fixedDelay` measures from the end of one run to the start of the next.
+- `fixedRate` measures start to start.
+- `cron` fires at calendar times. Spring cron has 6 fields with seconds first, and supports `L`, `W`, `#`, macros, a `zone`, and `"-"` to disable.
+
+On Boot's default scheduler (one thread), a `fixedRate` run that takes longer than the rate makes the next run late, not concurrent. The lab proves a 50 ms rate with a 200 ms task never overlaps, even with `pool.size=4`. Overlap happens only when each tick gets a new thread: `@Async` on the method, or virtual threads (`SimpleAsyncTaskScheduler`), which the lab also proves. Also, all `@Scheduled` methods share that one thread by default, so one slow task delays all the others.
+</details>
+
+<details><summary>Q6. You run 3 replicas. How do you stop a @Scheduled job running 3 times?</summary>
+
+Take a distributed lock per execution. ShedLock is the common choice: `@SchedulerLock(name, lockAtMostFor, lockAtLeastFor)` backed by a JDBC, Redis or Mongo lock table. `lockAtMostFor` covers a dead holder, and `lockAtLeastFor` covers clock skew between fast nodes. The alternatives:
+- Quartz in clustered JDBC mode, with misfire handling and persistent triggers;
+- leader election;
+- moving the trigger out of the app, e.g. a Kubernetes `CronJob` with `concurrencyPolicy: Forbid`.
+
+Spring Batch adds a second guard: the same `JobInstance` can't run concurrently, and a completed instance can't run again, as long as the identifying parameters are deterministic (a business date).
+</details>
+
+<details><summary>Q7. What does spring.threads.virtual.enabled=true change, and when shouldn't you use virtual threads?</summary>
+
+On Java 21+ it switches Boot's `applicationTaskExecutor` to a virtual-thread `SimpleAsyncTaskExecutor`, where pool properties no longer apply, and the scheduler to `SimpleAsyncTaskScheduler`. It also switches the embedded web server's request handling, Boot-configured messaging listeners and JDK `HttpClient`-based clients. It doesn't change executors you build yourself.
+
+Avoid virtual threads for:
+- CPU-bound work, since the carriers are limited to the cores;
+- code that relied on pool size as a throttle for a downstream;
+- heavy `ThreadLocal` caches;
+- on Java 21–23, `synchronized` sections around blocking I/O, because they pin the carrier. JEP 491 fixed that in Java 24, which is why Boot recommends 24+.
+
+Virtual threads are daemon threads, so set `spring.main.keep-alive=true` for apps with no other non-daemon thread.
+</details>
+
+<details><summary>Q8. Explain JobInstance vs JobExecution vs StepExecution.</summary>
+
+- A `JobInstance` is a logical run: the job name plus the hash of its identifying `JobParameters`, e.g. "the import for 2026-11-17".
+- A `JobExecution` is one attempt at that instance. A failed instance that is restarted gets a second `JobExecution` under the same instance.
+- A `StepExecution` is one attempt at one step inside a `JobExecution`. It holds the read/write/filter/skip/commit/rollback counters and its own persisted `ExecutionContext`.
+
+Launching completed identifying parameters again throws `JobInstanceAlreadyCompleteException`. Launching failed ones restarts the instance.
+</details>
+
+<details><summary>Q9. How does Spring Batch make a restart continue from the last committed chunk without duplicates?</summary>
+
+Each chunk runs in one transaction that commits three things:
+- the writer's business writes;
+- the step's updated counters;
+- the reader's position, which an `ItemStream` reader saves into the step `ExecutionContext` (e.g. `transactionReader.read.count`).
+
+These go to the JobRepository atomically. If item 25 fails, chunk 21–30 rolls back, and the context still says 20. On restart, with the same identifying parameters, completed steps are skipped and the reader's `open()` repositions to item 21. The lab asserts 20 rows after the crash, a `readCount` of 15 on restart, and 35 distinct rows. Writers to non-transactional systems must still be idempotent.
+</details>
+
+<details><summary>Q10. Skip vs retry vs filter in a chunk step?</summary>
+
+- **Filter:** the processor returns `null`. The item is dropped as a normal outcome (`filterCount`).
+- **Skip:** a declared skippable exception is thrown, and the item is dropped and counted (`readSkipCount`/`processSkipCount`/`writeSkipCount`) up to a skip limit or `SkipPolicy`. Exceeding the limit fails the step.
+- **Retry:** a declared retryable (transient) exception makes Batch re-attempt the operation up to the retry limit with back-off. If the retries are exhausted, the item can still be skipped if it's also skippable.
+
+In Batch 6 retry uses Framework 7 core retry, and the new `ChunkOrientedStep` skips or retries the item without rolling back the chunk. The lab shows `rollbackCount == 0`, where Batch 5 rolled back and re-processed the chunk.
+</details>
+
+<details><summary>Q11. Multi-threaded step vs partitioning vs remote chunking: which would you pick?</summary>
+
+- **Multi-threaded step:** one step with a `taskExecutor`. It's simple, but readers are shared, and classically it isn't restartable (`saveState(false)`). Batch 6's new model keeps reading and writing on one thread and parallelises the processor.
+- **Partitioning:** a manager step splits the data (per file, per ID range) into partitions, each a full `StepExecution` with its own reader and context. It's restartable per partition and can be local (thread pool) or remote (workers over messaging).
+- **Remote chunking:** the manager reads and sends chunks to workers that process and write. Use it when processing or writing dominates.
+- **Parallel steps:** independent steps run in a `split` flow.
+
+For a restartable file import, pick partitioning (the lab's choice).
+</details>
+
+<details><summary>Q12. What changed for Spring Batch in Boot 4 / Batch 6?</summary>
+
+- `JobLauncher` is deprecated: `JobOperator` extends it, so use `jobOperator.start(job, params)`.
+- `JobRepository` extends `JobExplorer`.
+- `@EnableBatchProcessing`/`DefaultBatchConfiguration` default to a resourceless repository. Opt into a DB with `@EnableJdbcJobRepository`.
+- In Boot, `spring-boot-starter-batch` is in-memory, and `spring-boot-starter-batch-jdbc` is needed for a DB repository.
+- `@EnableBatchProcessing` still makes Boot's auto-config back off.
+- Packages moved: `core.job`, `core.step`, `core.job.parameters`, and `infrastructure.*` for all item and repeat APIs.
+- `chunk(int).transactionManager(tm)` builds the new `ChunkOrientedStep`, and the `chunk(int, tm)` form is deprecated.
+- Retry is on Framework 7 core retry.
+- `JobParameter` is a record, and `BATCH_JOB_SEQ` became `BATCH_JOB_INSTANCE_SEQ`.
+- v5 executions can't be restarted on v6.
+- Tests use `JobOperatorTestUtils.startJob()`.
+</details>
+
+<details><summary>Q13. Your @Async pool is configured with max-size 50 but only ever uses 8 threads. Why?</summary>
+
+`ThreadPoolExecutor` grows beyond the core size only when the queue is full, and the default queue capacity is unbounded (`Integer.MAX_VALUE`). So it stays at the core size (Boot's default is 8) while tasks pile up in the queue. Set a bounded `queue-capacity`, and choose a rejection policy for when both the queue and max are full. `CallerRunsPolicy` gives back-pressure, and the default `AbortPolicy` throws `TaskRejectedException`.
+</details>
+
+<details><summary>Q14. When would you choose Spring Batch over a Kafka streaming consumer, and vice versa?</summary>
+
+Choose **Batch** for bounded datasets with a natural window:
+- partner files, regulatory and month-end reports, migrations, backfills, reconciliation;
+- cases where you need whole-dataset checks (trailer totals), restart-by-date semantics, and throughput over latency.
+
+Choose **streaming** when consumers must react within seconds:
+- fraud, balances, notifications;
+- cases where many independent consumers need the same events.
+
+Streaming brings offsets, idempotent consumers, dead-letter topics and lag monitoring in place of the JobRepository. Mature systems use both: events for real time, and batch for reconciliation and partner files.
+</details>
+
+<details><summary>Q15. How do you compose several CompletableFutures with a timeout and fallbacks, and on which thread do the callbacks run?</summary>
+
+Start all calls first, then compose:
+- `thenCombine` for two results;
+- `allOf(...)` plus `join()` on each for N results;
+- `thenCompose` to chain dependent async calls;
+- per call, `orTimeout`/`completeOnTimeout` and `exceptionally`/`handle` for fallbacks.
+
+Non-`Async` callbacks run on the thread that completes the future (the worker), or immediately on the caller if it's already complete. `*Async` variants without an executor use `ForkJoinPool.commonPool()`, which must not be used for blocking I/O, so pass an executor (a virtual-thread executor is ideal for I/O).
+</details>
+
+
