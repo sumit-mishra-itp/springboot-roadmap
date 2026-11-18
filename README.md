@@ -41,7 +41,7 @@ projects/   two capstone projects (resume-grade)
 - [x] 04 Configuration: YAML, profiles, `@ConfigurationProperties`, property precedence
 - [ ] 05 Web MVC / REST: DispatcherServlet, validation, `ProblemDetail`, API versioning, OpenAPI (lab `05-rest-api`)
 - [ ] 06 Data JPA / Hibernate: relationships, N+1, projections, transactions, locking, Flyway (lab `06-jpa-deep-dive`)
-- [ ] 07 Spring Security 7: filter chain, authN/authZ, method security, JWT, OAuth2 (lab `07-security-jwt`)
+- [x] 07 Spring Security 7: filter chain, authN/authZ, method security, JWT, OAuth2 (lab `07-security-jwt`)
 
 ## Phase B — Advanced
 

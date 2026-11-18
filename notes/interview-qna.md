@@ -593,3 +593,136 @@ A `Duration` carries its unit in the value (`30s`, `5m`, `PT1H`), so the propert
 </details>
 
 
+
+## 07 — Spring Security 7
+
+_From [notes/07-security/spring-security.md](07-security/spring-security.md)_
+
+
+<details><summary>Q1. Walk through what happens when a request hits a Spring Security protected endpoint.</summary>
+
+Tomcat calls `DelegatingFilterProxy` (registered by Boot as `springSecurityFilterChain`, order -100), which delegates to the `FilterChainProxy` bean. `FilterChainProxy` runs the `HttpFirewall`, then picks the **first** `SecurityFilterChain` whose `securityMatcher` matches, and runs its filters in order:
+1. `SecurityContextHolderFilter` lazily loads the context.
+2. Headers and CORS run.
+3. An authentication filter (`BearerTokenAuthenticationFilter`, `UsernamePasswordAuthenticationFilter`, `BasicAuthenticationFilter`) turns credentials into an `Authentication` via the `AuthenticationManager` and stores it in `SecurityContextHolder`.
+4. `AnonymousAuthenticationFilter` fills in an anonymous token if nothing authenticated the request.
+5. `ExceptionTranslationFilter` wraps the rest.
+6. `AuthorizationFilter` evaluates the `authorizeHttpRequests` rules.
+
+If the request is allowed, it reaches `DispatcherServlet`, where method-security proxies may check again. Afterwards `FilterChainProxy` clears the context.
+</details>
+
+<details><summary>Q2. Why does Spring Security need DelegatingFilterProxy AND FilterChainProxy?</summary>
+
+The servlet container creates filters before the Spring `ApplicationContext` exists and knows nothing about beans. `DelegatingFilterProxy` is a plain servlet filter that lazily looks up a bean by name, which bridges the two lifecycles. `FilterChainProxy` is that bean. It gives Spring Security a single entry point that can:
+- hold *several* chains with request matchers;
+- apply the firewall;
+- always clear the `SecurityContext`;
+- serve as one place to debug.
+
+All without registering dozens of filters in the container.
+</details>
+
+<details><summary>Q3. Authentication vs authorization, and 401 vs 403. Who decides which is returned?</summary>
+
+Authentication establishes identity, and authorization decides access. `ExceptionTranslationFilter` decides. An `AuthenticationException`, or an `AccessDeniedException` for an **anonymous** (or remember-me) user, triggers the `AuthenticationEntryPoint`, which returns 401 with `WWW-Authenticate`, or a redirect to login. An `AccessDeniedException` for an authenticated user goes to the `AccessDeniedHandler`, which returns 403. A bad bearer token fails earlier, in `BearerTokenAuthenticationFilter`, which calls the resource server's entry point directly.
+</details>
+
+<details><summary>Q4. Explain AuthenticationManager, ProviderManager, AuthenticationProvider, UserDetailsService and PasswordEncoder.</summary>
+
+- **`AuthenticationManager`** is the single-method contract `authenticate(Authentication)`.
+- **`ProviderManager`** implements it by iterating `AuthenticationProvider`s that `supports()` the token type, falling back to a parent manager, erasing credentials, and publishing events.
+- **`DaoAuthenticationProvider`** loads a `UserDetails` from a `UserDetailsService` and runs account checks (locked, disabled, expired). It verifies the password with a `PasswordEncoder`, optionally upgrades the hash via `UserDetailsPasswordService`, and hides user-not-found as bad credentials, with a dummy hash check against timing attacks.
+- **`JwtAuthenticationProvider`** is the bearer equivalent: `JwtDecoder` plus `JwtAuthenticationConverter`.
+</details>
+
+<details><summary>Q5. Why is the SecurityContext empty inside an @Async method, and how do you fix it?</summary>
+
+The default `SecurityContextHolderStrategy` is a `ThreadLocal`, and `@Async` runs the method on an executor thread that never had the context set. Fixes:
+- Wrap the executor in `DelegatingSecurityContextAsyncTaskExecutor` (or the `ExecutorService`/`Runnable` variants), which copies the context in and clears it afterwards.
+- Use Micrometer context propagation.
+- Pass the needed identity as parameters.
+
+Avoid `MODE_INHERITABLETHREADLOCAL` with thread pools, because pooled threads keep the context of whoever created them.
+</details>
+
+<details><summary>Q6. How do you implement JWT authentication in modern Spring, and why not write a JwtFilter?</summary>
+
+Use the OAuth2 resource server: `http.oauth2ResourceServer(o -> o.jwt(...))` with a `JwtDecoder`. Either `issuer-uri` (JWKS discovery for an IdP) or `NimbusJwtDecoder.withPublicKey`/`withSecretKey` for self-issued tokens, with `NimbusJwtEncoder` to sign them. Map claims with a `JwtAuthenticationConverter`. The framework handles:
+- header parsing (RFC 6750);
+- signature verification with algorithm pinning;
+- `exp`/`nbf` with clock skew, `typ`, and optional `iss`/`aud` validators;
+- JWKS caching and key rotation;
+- correct 401 + `WWW-Authenticate` responses;
+- integration with `ExceptionTranslationFilter`.
+
+Hand-rolled filters routinely miss several of these and break `permitAll` paths.
+</details>
+
+<details><summary>Q7. RS256 vs HS256, and what is a JWK set?</summary>
+
+HS256 is an HMAC with one shared secret. Everyone who can verify can also forge, so it only suits a single app. RS256/ES256 sign with a private key and verify with a public key, so many services can verify and only the issuer can mint. A JWK set is the issuer's public keys published as JSON at `jwks_uri`, each with a `kid`. The JWT header names the `kid`, so verifiers pick the right key and keys can rotate without downtime. Pin algorithms and never accept `alg: none`. Never let a token's header switch you from RSA to HMAC, because that's the algorithm-confusion attack.
+</details>
+
+<details><summary>Q8. Describe the authorization code flow with PKCE. Why PKCE?</summary>
+
+1. The client creates a random `code_verifier` and sends `code_challenge = BASE64URL(SHA-256(verifier))` with the `/authorize` redirect, along with `state` (and `nonce` for OIDC).
+2. The user logs in at the authorization server, which redirects back with a short-lived `code`.
+3. The client exchanges the code plus the `code_verifier` at `/token`.
+4. The AS checks the hash and returns the tokens.
+
+PKCE ensures that a stolen authorization code is useless to anyone who didn't start the flow. OAuth 2.1 requires it for all clients, and Spring Authorization Server enables it by default since 7.0. The implicit and password grants are gone. The password grant was removed from Spring Security 7.
+</details>
+
+<details><summary>Q9. Where should an SPA keep its tokens? Explain the BFF pattern.</summary>
+
+Not in `localStorage`/`sessionStorage`, because any XSS can read and exfiltrate them. With a BFF, a server-side component acts as a confidential OAuth client, runs code + PKCE, and stores the tokens in its session. The browser gets only an `HttpOnly; Secure; SameSite` cookie. The BFF attaches the access token when proxying API calls and refreshes it server-side. The cost is that cookies are back, so CSRF protection is required (`csrf.spa()` in 7.0), and the BFF holds state.
+</details>
+
+<details><summary>Q10. JWT vs opaque tokens, and how do you revoke a JWT?</summary>
+
+A JWT is self-contained and validated locally (fast, no network call), but it stays valid until `exp`. An opaque token is a random reference validated by introspection at the AS, so it can be revoked instantly but costs a network call per request (cache it). JWT revocation options:
+- a short TTL with refresh-token rotation;
+- re-checking user state on refresh;
+- a `jti` deny-list in Redis until `exp`;
+- a per-user "tokens valid after" timestamp;
+- opaque tokens for high-risk APIs;
+- signing-key rotation as the nuclear option.
+</details>
+
+<details><summary>Q11. How does refresh-token rotation with reuse detection work?</summary>
+
+Each refresh invalidates the presented refresh token and issues a new one in the same *family* (one family per login). If an already-used token is presented again, somebody holds a copy, so the server revokes the whole family and every holder must log in again. Store only hashes, make check-and-mark atomic (a conditional `UPDATE` or a lock), add an absolute family lifetime, and consider a short grace period for concurrent refreshes. Refresh tokens should be opaque, or at least never accepted as access tokens. The lab tests exactly this sequence.
+</details>
+
+<details><summary>Q12. When do you need CSRF protection, and why is it safe to disable for a JWT API?</summary>
+
+CSRF exploits credentials the browser sends automatically (cookies, HTTP Basic, client certs). A malicious site can make the victim's browser POST to your app *with* those credentials. Any cookie- or session-based app, including a BFF, needs CSRF tokens and/or `SameSite` cookies. An API that authenticates *only* via an `Authorization: Bearer` header set by JavaScript isn't vulnerable, because a cross-site page can't attach that header. If the "JWT" lives in a cookie, you need CSRF protection again.
+</details>
+
+<details><summary>Q13. How does @PreAuthorize work internally, and when is it silently skipped?</summary>
+
+`@EnableMethodSecurity` registers advisors (`AuthorizationManagerBeforeMethodInterceptor` for `@PreAuthorize`, and the after-interceptor for `@PostAuthorize`). AOP wraps matching beans in proxies (CGLIB by default). Before or after the call, `PreAuthorizeAuthorizationManager`/`PostAuthorizeAuthorizationManager` evaluate the SpEL with `MethodSecurityExpressionHandler` (`authentication`, `#param`, `returnObject`, `@bean`). A denial throws `AuthorizationDeniedException`, which `ExceptionTranslationFilter` turns into a 403. Because it's a proxy, it's skipped for self-invocation, private and final methods, and objects created with `new`. `@PostAuthorize` runs *after* the method, so use it only for reads.
+</details>
+
+<details><summary>Q14. How do you support several identity providers (multi-tenant) in one resource server?</summary>
+
+Use `JwtIssuerAuthenticationManagerResolver.fromTrustedIssuers(...)`, or a custom `AuthenticationManagerResolver`, in `oauth2ResourceServer(o -> o.authenticationManagerResolver(resolver))`. It peeks at the unverified `iss` *only* to select a trusted issuer from an allow-list, then validates the signature with that issuer's JWKS. The per-issuer decoders are cached. Never fetch keys from an arbitrary `iss`. Then enforce tenant isolation on every data access (resource tenant equals token tenant).
+</details>
+
+<details><summary>Q15. What changed in Spring Security 7?</summary>
+
+- **Removed:** `and()` (the lambda DSL only) and `authorizeRequests`. `AntPathRequestMatcher`/`MvcRequestMatcher` were replaced by `PathPatternRequestMatcher`. `AuthorizationManager#check` was replaced by `authorize`. The OAuth2 password grant is gone.
+- **Moved:** the Access API (`AccessDecisionManager`/voters) into `spring-security-access`.
+- **New:**
+  - built-in **MFA** (`FactorGrantedAuthority` such as `FACTOR_PASSWORD`/`FACTOR_BEARER`, `@EnableMultiFactorAuthentication`, `AuthorizationManagerFactories.multiFactor()`);
+  - `AuthorizationManagerFactory`, `Authentication.Builder`, and `csrf.spa()`;
+  - `NimbusJwtEncoder` builders and Password4j encoders;
+  - Spring Authorization Server merged in, with PKCE on by default.
+- **Changed:** JWT `typ` validation by default, and Jackson 3 modules.
+- **7.1 adds:** `anyOf` factor sets, conditional MFA, `RestClientOpaqueTokenIntrospector`, and `charset` in `WWW-Authenticate`.
+
+In Boot 4 the starters are renamed `spring-boot-starter-security-oauth2-*`.
+</details>
+
+
