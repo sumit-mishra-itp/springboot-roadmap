@@ -1,5 +1,6 @@
 - [Home](README.md)
 - **Phase A: Revision**
+  - [00 Java 21 refresher](00-java-refresher/java21-for-spring.md)
   - [01 Spring Core: IoC & DI](01-core/spring-core.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
