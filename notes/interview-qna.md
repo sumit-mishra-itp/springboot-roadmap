@@ -810,3 +810,138 @@ Never base `hashCode` on a generated id: it changes when `persist()` assigns the
 </details>
 
 
+
+## 05 — Web MVC & REST APIs
+
+_From [notes/05-web-mvc-rest/rest-apis.md](05-web-mvc-rest/rest-apis.md)_
+
+
+<details><summary>Q1. Walk me through what happens when a request hits a Spring MVC application.</summary>
+
+Tomcat accepts the connection and runs the servlet **filter chain** (security, CORS, logging), which ends in the `DispatcherServlet`. `doDispatch` then:
+1. Asks each `HandlerMapping` for a handler. `RequestMappingHandlerMapping` matches the path, method, headers, consumes/produces and (Framework 7) API version, and returns a `HandlerExecutionChain` (the `HandlerMethod` plus interceptors).
+2. Finds a `HandlerAdapter` (`RequestMappingHandlerAdapter`).
+3. Runs interceptor `preHandle`s.
+4. The adapter resolves arguments with `HandlerMethodArgumentResolver`s. `@RequestBody` uses an `HttpMessageConverter` (Jackson 3), followed by validation. It invokes the controller and handles the return value with a `HandlerMethodReturnValueHandler`, which for `@ResponseBody`/`ResponseEntity` serializes the body through a converter chosen by content negotiation.
+5. Runs `postHandle` (reverse order). It is skipped on exceptions.
+6. On an exception, the `HandlerExceptionResolver` chain runs (`@ExceptionHandler` / `@ControllerAdvice` first).
+7. Runs `afterCompletion` (always, reverse order).
+
+Then control returns through the filters.
+</details>
+
+<details><summary>Q2. Filter vs HandlerInterceptor vs AOP: when do you use each?</summary>
+
+A **Filter** is servlet-level. It sees every request, including static resources and error dispatches, can wrap the request/response, and runs outside Spring MVC (its exceptions don't reach `@ExceptionHandler`). Use it for security, CORS, correlation IDs/MDC, compression and request logging.
+
+An **interceptor** runs inside the `DispatcherServlet` only for mapped requests, and knows the `HandlerMethod` (so it can read annotations). Use it for endpoint-aware checks, locale/tenant resolution and per-endpoint metrics.
+
+**AOP** wraps bean methods regardless of the caller (HTTP, messaging, schedulers). Use it for transactions, caching, retries and auditing business methods.
+
+Order for a request: filter → interceptor → (aspect around the controller/service) → back out.
+</details>
+
+<details><summary>Q3. @Controller vs @RestController, and how does a returned object become JSON?</summary>
+
+`@RestController` is `@Controller` plus `@ResponseBody` on all methods. With `@Controller`, a `String` is a view name. With `@RestController`, the return value is written to the body. `RequestResponseBodyMethodProcessor` (or `HttpEntityMethodProcessor` for `ResponseEntity`) runs content negotiation: it takes the `Accept` header, intersects it with `produces` and the converters that can write the type, picks a media type, and calls that `HttpMessageConverter`. For JSON in Boot 4 that is `JacksonJsonHttpMessageConverter`, backed by Jackson 3's `JsonMapper`. No acceptable match gives 406.
+</details>
+
+<details><summary>Q4. MethodArgumentNotValidException vs HandlerMethodValidationException?</summary>
+
+`MethodArgumentNotValidException` is thrown when a single `@Valid @RequestBody`/`@ModelAttribute` argument fails, and the method has no constraint annotations directly on its parameters. It carries a `BindingResult`. `HandlerMethodValidationException` comes from Spring MVC's built-in **method validation** (6.1+). It's triggered when any `@Constraint` (`@Min`, `@NotBlank`, `@NotNull`...) sits directly on a parameter or the return value. It validates all parameters, including nested `@Valid` ones, and carries a list of `ParameterValidationResult`s. Handle both, because adding `@NotNull` to a body parameter switches which one you get. Don't put class-level `@Validated` on controllers. That uses the AOP `MethodValidationPostProcessor` and throws `ConstraintViolationException` instead.
+</details>
+
+<details><summary>Q5. What is ProblemDetail and how do you implement consistent errors?</summary>
+
+`ProblemDetail` is Spring's model of **RFC 9457** (which obsoletes 7807): `type`, `title`, `status`, `detail`, `instance`, plus extension members, served as `application/problem+json`. All Spring MVC exceptions implement `ErrorResponse`. Create **one** `@RestControllerAdvice` that extends `ResponseEntityExceptionHandler`. That gives ProblemDetail bodies for every framework exception. Add `@ExceptionHandler` methods for domain exceptions that return a `ProblemDetail` with a meaningful `type` URI, and override the validation handlers to add field errors as an extension property (rendered top-level). Keep controllers free of try/catch. Spring fills `instance` with the request path and omits `type` when it is `about:blank`.
+</details>
+
+<details><summary>Q6. PUT vs PATCH vs POST? Which are idempotent and why does it matter?</summary>
+
+POST creates or triggers processing and is **not idempotent**: two calls may create two resources. PUT replaces the full representation at a known URI and is **idempotent**: N identical PUTs leave the same state. PATCH applies a partial change (JSON Merge Patch RFC 7396 or JSON Patch RFC 6902) and is not guaranteed idempotent. DELETE is idempotent (same final state, even if the second call returns 404/204). GET/HEAD/OPTIONS are **safe** and idempotent.
+
+It matters because clients, proxies and gateways may **automatically retry** idempotent requests after timeouts, but must not blindly retry POST. That's why payment POSTs need idempotency keys.
+</details>
+
+<details><summary>Q7. How would you make POST /payments safe to retry?</summary>
+
+Use an **idempotency key**. The client sends a unique `Idempotency-Key` (a UUID) per logical operation, the same on every retry. The server atomically claims the key (unique constraint or `SET NX`), scoped per account, together with a hash of the request. It performs the work, stores the response code and body, and replays them for retries (`Idempotent-Replayed: true`). Same key with a different body gives 422. Same key while the first is still running gives 409 (or wait and replay). Keys expire after ~24h. Ideally the key row is written in the same DB transaction as the payment, so they can't diverge. That's Stripe's design (section 7.1).
+</details>
+
+<details><summary>Q8. Explain ETags and conditional requests. How do they prevent lost updates?</summary>
+
+An `ETag` is a validator for a representation (a hash or a version). On **GET**, the client sends `If-None-Match: "3"`. If it is unchanged the server returns **304** with no body, which saves bandwidth. In Spring, returning `ResponseEntity.ok().eTag(...)` makes `HttpEntityMethodProcessor` do this automatically. `ShallowEtagHeaderFilter` does it generically by hashing the body, but the controller still runs.
+
+On **PUT/PATCH**, the client sends `If-Match: "3"`. The server applies the change only if the current version is still 3, otherwise it returns **412 Precondition Failed**. That's optimistic concurrency over HTTP. It prevents two editors overwriting each other's changes (lost update), and it maps naturally onto JPA `@Version`. You can require it with 428. Weak ETags (`W/`) never match `If-Match`.
+</details>
+
+<details><summary>Q9. Offset vs cursor pagination: which would you choose for an infinite feed and why?</summary>
+
+Offset (`LIMIT/OFFSET`) allows random page access and totals, but deep pages get slower because the DB walks skipped rows. Rows also shift when data changes, causing duplicates or misses, and `COUNT(*)` is costly. Cursor/keyset pagination uses `WHERE (sort_key, id) < (:last) ORDER BY ... LIMIT n+1`. It's an index seek with constant cost, it's stable under inserts, and it needs no count. For an infinite feed, choose **cursor**, with an opaque cursor and a unique tie-breaker. Use offset for admin tables that need "page 7 of 12".
+</details>
+
+<details><summary>Q10. How do you version a REST API, and what does Spring Framework 7 add?</summary>
+
+There are four strategies: URI path (`/v2/...`), header (`API-Version: 2`), query param, and media-type parameter. Version **only on breaking changes**. Framework 7 adds first-class support:
+- `WebMvcConfigurer#configureApiVersioning` (or `spring.mvc.apiversion.*`) chooses the resolver.
+- `@GetMapping(version = "1.0")` gives a fixed match, `"2.0+"` a baseline (that version and higher supported ones), and no version matches any.
+- Versions are parsed semantically.
+- Unsupported versions give 400 `InvalidApiVersionException`, and a missing version gives 400 unless you set a default.
+- `StandardApiVersionDeprecationHandler` emits `Deprecation`/`Sunset`/`Link` headers.
+- Clients use `ApiVersionInserter` on `RestClient`/`WebClient`.
+
+With header versioning, add `Vary: API-Version` and allow the header in CORS.
+</details>
+
+<details><summary>Q11. Can you modify response headers in HandlerInterceptor.postHandle?</summary>
+
+Not reliably for `@ResponseBody`/`ResponseEntity`. The body is written inside the `HandlerAdapter`, *before* `postHandle`. If the body overflowed the container's buffer (Tomcat's default is 8 KB), the response is already committed and your header is silently dropped. If it's small and still buffered, the header goes out. The lab proves both cases. That size-dependent behaviour is a trap. Set headers in `preHandle`, a `Filter`, the controller, or a `ResponseBodyAdvice` (which runs just before the converter writes).
+</details>
+
+<details><summary>Q12. What is the Richardson Maturity Model, and do you need HATEOAS?</summary>
+
+The levels are:
+- 0: one endpoint, RPC style.
+- 1: resources.
+- 2: HTTP verbs + status codes.
+- 3: hypermedia controls (HATEOAS), where responses include links that describe available state transitions.
+
+Most production APIs are level 2. HATEOAS (Spring HATEOAS: `EntityModel`, `linkTo(methodOn(...))`, HAL) helps long-lived public APIs with workflows, because clients follow links instead of hard-coding URLs and state rules. For internal APIs with a known client and an OpenAPI contract, it's usually not worth the payload and complexity. Say so, and explain the trade-off.
+</details>
+
+<details><summary>Q13. RestTemplate vs RestClient vs WebClient vs @HttpExchange?</summary>
+
+- **`RestTemplate`**: the old template-method client. It's in maintenance mode.
+- **`RestClient`** (6.1+): a fluent, synchronous client on the same infrastructure. It's the default for blocking code, and ideal with virtual threads.
+- **`WebClient`**: reactive and non-blocking, for WebFlux or streaming.
+- **`@HttpExchange` interfaces**: declarative clients (like Feign) backed by `RestClient` or `WebClient`. Framework 7 / Boot 4 add `@ImportHttpServices` groups configured via `spring.http.serviceclient.<group>.*`.
+
+Inject Boot's `RestClient.Builder` so converters, observability and SSL are applied. Use `ApiVersionInserter` for versioned APIs.
+</details>
+
+<details><summary>Q14. What changes when you enable virtual threads in a Spring MVC app?</summary>
+
+With `spring.threads.virtual.enabled=true`, Tomcat handles each request on a virtual thread (lab-proven), and `@Async`/the scheduler use virtual-thread executors. Blocking I/O no longer wastes platform threads, so thread-per-request scales to many thousands of concurrent requests with plain blocking code. The consequences:
+- `server.tomcat.threads.*` sizing is ignored.
+- The bottleneck moves to connection pools and downstream services, so add limits.
+- `synchronized` blocks pin carriers on Java 21–23 (fixed in JDK 24, JEP 491).
+- `ThreadLocal` caches lose their pooling benefit.
+- Virtual threads are daemon threads (`spring.main.keep-alive=true` for scheduler-only apps).
+
+It doesn't make CPU-bound work faster.
+</details>
+
+<details><summary>Q15. What changed for JSON in Spring Boot 4?</summary>
+
+Jackson 3 is the default:
+- Packages are `tools.jackson.*`, and annotations stay in `com.fasterxml.jackson.annotation`.
+- Boot auto-configures an immutable `JsonMapper`, so to override it you define a `JsonMapper` bean (an `ObjectMapper` bean is no longer enough) or a `JsonMapperBuilderCustomizer`.
+- `@JsonComponent` is now `@JacksonComponent`, and `spring.jackson.read/write.*` moved under `spring.jackson.json.*`.
+- Exceptions are unchecked (`JacksonException`).
+- Defaults changed: ISO dates, unknown properties ignored, alphabetical property order, `java.time` built in.
+- Converters are customized with `ServerHttpMessageConvertersCustomizer`.
+
+Jackson 2 is available only through the deprecated `spring-boot-jackson2` module.
+</details>
+
+
