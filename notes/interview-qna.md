@@ -945,3 +945,104 @@ Jackson 2 is available only through the deprecated `spring-boot-jackson2` module
 </details>
 
 
+
+## 09 — Caching & Redis
+
+_From [notes/09-caching-redis/caching-redis.md](09-caching-redis/caching-redis.md)_
+
+
+<details><summary>Q1. How does @Cacheable work internally?</summary>
+
+`@EnableCaching` registers `AnnotationCacheOperationSource`, `CacheInterceptor` and `BeanFactoryCacheOperationSourceAdvisor`. The auto-proxy creator wraps matching beans in a (CGLIB, by default) proxy after initialization. On a call, `CacheInterceptor` (via `CacheAspectSupport.execute`) resolves the cached `CacheOperation`s, evaluates `condition`, computes the key (SpEL `key` or the `KeyGenerator`), and asks `CacheManager.getCache(name).get(key)`. On a hit it returns without invoking the target. On a miss it invokes the target, evaluates `unless` against `#result`, and `put`s the value. Because it's a proxy, self-invocation, private/final methods and `new`-created objects aren't cached.
+</details>
+
+<details><summary>Q2. What is the default cache key? Why is it risky with Redis?</summary>
+
+`SimpleKeyGenerator`: no params gives `SimpleKey.EMPTY`, one param is the param itself, and multiple params give `SimpleKey(params)`. On Redis the key is stringified, e.g. `quotes::SimpleKey [1, EUR]`. It's fragile: reordering or adding a parameter changes all keys, two methods sharing a cache with the same args collide, and type differences (`Integer` vs `Long`) can matter for local caches. Always give an explicit `key` SpEL or a custom `KeyGenerator`, e.g. to add a tenant id.
+</details>
+
+<details><summary>Q3. condition vs unless?</summary>
+
+`condition` is evaluated before the method runs, and if false the cache is bypassed entirely (no lookup, no put). `unless` is evaluated after the method runs, can reference `#result`, and only vetoes the put. `unless = "#result == null"` is the common way to avoid caching misses. `sync = true` doesn't support `unless`.
+</details>
+
+<details><summary>Q4. What does sync = true do, and does it protect against a stampede on Redis?</summary>
+
+It makes the interceptor call `Cache.get(key, valueLoader)` so the cache implementation can let only one caller load while the others wait. Caffeine and `ConcurrentMapCache` do this per JVM (`computeIfAbsent`). On Spring Data Redis 4.x, `RedisCache.get(key, loader)` isn't synchronized. With Boot's default non-locking writer, 8 concurrent misses run the loader 8 times (proven in the lab). With `RedisCacheWriter.create(cf, c -> c.enableLocking())` misses collapse to one load across all JVMs, but the lock is per *cache* (`products~lock`), so a slow load also stalls hits on other keys. Restrictions: `sync` can't be combined with `unless`, multiple caches, or other cache operations on the method.
+</details>
+
+<details><summary>Q5. Explain cache-aside, read-through, write-through, write-behind and refresh-ahead.</summary>
+
+- **Cache-aside:** the app reads the cache, and on a miss loads from the DB and populates the cache. On write it updates the DB and evicts. This is `@Cacheable` + `@CacheEvict`.
+- **Read-through:** the cache itself loads on a miss via a registered loader (Caffeine `LoadingCache`, JCache `CacheLoader`).
+- **Write-through:** writes go to the cache, which synchronously writes the DB, so both are updated before acknowledging.
+- **Write-behind:** the cache acknowledges and flushes to the DB asynchronously in batches. It's fast, but can lose data.
+- **Refresh-ahead:** hot entries are reloaded before expiry (Caffeine `refreshAfterWrite`), so readers never see the miss.
+</details>
+
+<details><summary>Q6. Update the DB then delete the cache, or delete then update? What race remains?</summary>
+
+Update the DB, then delete. Delete-first lets a concurrent reader re-cache the old value before the update commits. Delete-after-write still has a rare race: a reader misses, reads the old row, the writer commits and deletes, then the reader `SET`s the stale value. Mitigations: always set a TTL (it bounds the staleness), delayed double delete (delete again after about 500 ms), evict after commit (cache advice outside the transaction, or `transactionAware()`), versioned compare-and-set, or CDC-based invalidation. Prefer evict over put, because concurrent puts can leave the older value.
+</details>
+
+<details><summary>Q7. Stampede vs penetration vs avalanche, and how do you handle each?</summary>
+
+- **Stampede:** a hot key expires and many concurrent misses hit the DB. Handle it with `sync`/locks (single-flight), refresh-ahead, or probabilistic early expiration.
+- **Penetration:** lookups for non-existent keys always miss. Handle it with null caching with a short TTL, a Bloom filter in front, and input validation.
+- **Avalanche:** many keys expire at once, or the cache goes down. Handle it with TTL jitter, staggered warm-up, Redis HA, multi-level caching, and DB circuit breakers or rate limits.
+</details>
+
+<details><summary>Q8. Why is Redis single-threaded yet fast, and what does that imply?</summary>
+
+Data is in memory, commands are simple, and one event loop with I/O multiplexing avoids locking and context switches. Redis 6+ can offload socket I/O to threads, but command execution remains single-threaded. Implications: every command and Lua script is atomic (great for counters, locks and rate limits), and one slow command (`KEYS *`, a huge `HGETALL`, a long script) blocks all clients. Use `SCAN` and watch `SLOWLOG`.
+</details>
+
+<details><summary>Q9. RDB vs AOF? Which eviction policy for a cache?</summary>
+
+RDB takes periodic fork-based snapshots: compact and fast to restart, but you lose writes since the last snapshot. AOF logs every write with `appendfsync everysec` (about 1 s of loss), and gets bigger and is rewritten periodically. Production stores often use both. A pure cache can skip persistence. The `maxmemory-policy` default is `noeviction`, where writes fail when full. For caches use `allkeys-lru` or `allkeys-lfu`. `volatile-*` policies only evict keys with a TTL.
+</details>
+
+<details><summary>Q10. Sentinel vs Cluster?</summary>
+
+Sentinel provides HA for a single primary dataset: sentinels monitor it, vote on a quorum, promote a replica, and tell clients the new primary. It doesn't scale writes. Cluster shards the keyspace into 16384 hash slots across several primaries (each with replicas), handles failover itself, and clients follow `MOVED`/`ASK` redirects. Multi-key operations and Lua scripts must stay within one slot, so use hash tags like `{user:42}`. Replication is asynchronous in both, so a failover can lose recent writes.
+</details>
+
+<details><summary>Q11. Lettuce vs Jedis?</summary>
+
+Lettuce (Boot's default) is Netty-based and non-blocking. One connection is thread-safe and shared, and it offers sync, async and reactive APIs, so it is required for `ReactiveRedisTemplate`. Pooling is optional and only useful for blocking commands or transactions. Jedis uses blocking sockets and one connection per thread, so it needs a pool. It's simple and fast, but has no reactive API. Switch to it by excluding `lettuce-core` and adding `jedis`.
+</details>
+
+<details><summary>Q12. How do you build a distributed lock on Redis, and what's the Redlock debate?</summary>
+
+`SET lock:res <random token> NX PX <ttl>` to acquire atomically with a lease. Release with a Lua compare-and-delete so you never delete someone else's lock. The TTL means a paused holder can lose the lock while still working, so correctness requires fencing tokens checked by the resource. Redlock acquires the lock on a majority of N independent masters. Kleppmann argued it relies on timing assumptions and lacks fencing, and antirez countered. Use Redis locks for efficiency. For correctness use consensus (ZooKeeper, etcd) or DB locks plus fencing. Libraries: Redisson (`RLock` with a watchdog lease extension) and ShedLock (single-node `@Scheduled` execution).
+</details>
+
+<details><summary>Q13. Compare rate-limiting algorithms and how you'd implement one in Redis.</summary>
+
+- **Fixed window:** `INCR` + `EXPIRE` on the first hit, atomically in Lua. Cheap, but allows 2× bursts at boundaries.
+- **Sliding log:** a ZSET of timestamps (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`). Exact, but memory-heavy.
+- **Sliding window counter:** a weighted current plus previous window. O(1) and accurate enough.
+- **Token bucket:** a hash of tokens plus the last refill, refilled in Lua. Allows bursts up to capacity with a steady rate. Spring Cloud Gateway's `RedisRateLimiter` uses it.
+
+Always make check-and-update atomic, decide fail-open vs fail-closed, and return 429 with `Retry-After`.
+</details>
+
+<details><summary>Q14. How do @Transactional and @Cacheable interact on the same method?</summary>
+
+Both are advisors on one proxy. Both `@EnableCaching` and `@EnableTransactionManagement` default to `LOWEST_PRECEDENCE`, so set their `order` explicitly. With caching outside (lower order value), cache hits don't open a transaction, and evicts run after commit, so readers can't re-cache uncommitted-old data. With caching inside, puts and evicts happen before commit, and a rollback leaves the cache inconsistent. If you can't control the order, `RedisCacheManager.builder().transactionAware()` (`TransactionAwareCacheDecorator`) defers put/evict to after commit.
+</details>
+
+<details><summary>Q15. What changed for Redis caching in Boot 4 / Spring Data Redis 4?</summary>
+
+- Jackson 3 serializers: `GenericJacksonJsonRedisSerializer` and `JacksonJsonRedisSerializer`, with the Jackson 2 versions deprecated. The generic one no longer enables default typing.
+- With Lettuce, the cache writer does async put/evict unless `immediateWrites()` is set.
+- `getTtl()` was replaced by `TtlFunction`.
+- `RedisCache.get(key, loader)` isn't synchronized, so `sync` needs a locking writer.
+- Boot's modular `spring-boot-cache` / `spring-boot-data-redis` modules and `*-test` starters, with renamed `DataRedisProperties` / `DataRedisConnectionDetails`.
+- `spring.session.redis.*` was renamed to `spring.session.data.redis.*`.
+- `spring.data.redis.masterreplica.nodes`.
+- Lettuce-native observability.
+- Testcontainers 2.
+</details>
+
+

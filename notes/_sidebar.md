@@ -8,6 +8,8 @@
   - [05 Web MVC & REST APIs](05-web-mvc-rest/rest-apis.md)
   - [06 Data JPA & Hibernate](06-data-jpa/jpa-hibernate.md)
   - [07 Spring Security 7](07-security/spring-security.md)
+- **Phase B: Advanced**
+  - [09 Caching & Redis](09-caching-redis/caching-redis.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)
