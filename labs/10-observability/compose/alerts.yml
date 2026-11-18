@@ -1,0 +1,32 @@
+groups:
+  - name: observability-lab-slos
+    rules:
+      # RED: Errors. More than 5% of requests failing for 5 minutes.
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_server_requests_seconds_count{outcome="SERVER_ERROR"}[5m]))
+            / sum(rate(http_server_requests_seconds_count[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 5% of HTTP requests are failing"
+
+      # RED: Duration. p99 checkout latency above 500 ms, computed from histogram buckets.
+      - alert: SlowCheckout
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(orders_checkout_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 checkout latency is above 500 ms"
+
+      # Health: the scrape target disappeared.
+      - alert: InstanceDown
+        expr: up{job="observability-lab"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus cannot scrape the app"
