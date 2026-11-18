@@ -1,0 +1,6 @@
+# Used by spring-boot-docker-compose on ./mvnw spring-boot:run: Boot starts it and wires spring.data.redis.* itself.
+services:
+  redis:
+    image: 'redis:7-alpine'
+    ports:
+      - '6379'
