@@ -10,6 +10,8 @@
   - [07 Spring Security 7](07-security/spring-security.md)
 - **Phase B: Advanced**
   - [09 Caching & Redis](09-caching-redis/caching-redis.md)
+  - [10 Observability](10-observability/observability.md)
+  - [12 Async, scheduling & Batch](12-async-batch/async-scheduling-batch.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)

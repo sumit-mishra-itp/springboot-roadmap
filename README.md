@@ -47,7 +47,7 @@ projects/   two capstone projects (resume-grade)
 
 - [ ] 08 Testing: slices, `@MockitoBean`, Testcontainers, `@ServiceConnection`, RestTestClient
 - [x] 09 Caching + Redis: cache abstraction, TTL, cache-aside, stampede (lab `09-redis-cache`)
-- [ ] 10 Observability: Actuator, Micrometer, OpenTelemetry, Prometheus/Grafana (lab `10-observability`)
+- [x] 10 Observability: Actuator, Micrometer, OpenTelemetry, Prometheus/Grafana (lab `10-observability`)
 - [ ] 11 Messaging with Kafka: retries, DLT, idempotency, outbox (lab `11-kafka`)
 - [ ] 12 Async, scheduling, Spring Batch, virtual threads (lab `12-batch-csv-import`)
 - [ ] 13 Reactive: WebFlux, Reactor, R2DBC (lab `13-webflux`)

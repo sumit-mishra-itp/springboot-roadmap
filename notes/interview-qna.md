@@ -1046,3 +1046,100 @@ Both are advisors on one proxy. Both `@EnableCaching` and `@EnableTransactionMan
 </details>
 
 
+
+## 10 — Observability
+
+_From [notes/10-observability/observability.md](10-observability/observability.md)_
+
+
+<details><summary>Q1. What are the three pillars of observability, and how do you correlate them?</summary>
+
+Metrics (cheap aggregates for detection and alerting), traces (per-request causal timing across services, for localization) and logs (discrete events with detail, for explanation). Profiles are often called the fourth. Correlation comes from shared identifiers. The trace id is put into the MDC, so every log line carries `traceId`/`spanId`. Metrics carry exemplars (sample trace ids on histogram buckets). Common resource attributes (`service.name`, `deployment.environment`) are shared by all signals. In an incident you go from metric spike → exemplar → trace → logs filtered by trace id.
+</details>
+
+<details><summary>Q2. Which actuator endpoints are exposed by default, and how do you secure them?</summary>
+
+Over HTTP and JMX, only `health` is exposed by default. Exposure (`management.endpoints.web.exposure.include`) decides URLs. Access (`management.endpoint.<id>.access` = none/read-only/unrestricted, since 3.4) decides whether the endpoint exists at all and whether write operations are allowed. `shutdown` and `heapdump` are restricted by default. To secure them, use a dedicated `SecurityFilterChain` matched by `EndpointRequest.toAnyEndpoint()`: permit `health` (and maybe `info`) and require an ops role for the rest. Optionally move actuator to `management.server.port` on an internal network. Never expose `*` publicly: `heapdump` and `env` leak secrets.
+</details>
+
+<details><summary>Q3. Explain liveness vs readiness. Why shouldn't liveness check the database?</summary>
+
+Liveness means "this process is broken, restart it". Readiness means "don't route traffic to me right now". Boot backs them with `LivenessState` and `ReadinessState` and exposes them as health groups (on by default in Boot 4). If liveness includes a shared dependency such as the DB, a DB blip fails liveness on *every* pod at once. Kubernetes restarts them all, and the cold starts stampede the recovering DB, which is a cascading failure. A dependency outage should at most affect readiness, or better, be handled with circuit breakers and degraded responses. Use a startup probe for slow boots.
+</details>
+
+<details><summary>Q4. What happens to readiness during graceful shutdown?</summary>
+
+On SIGTERM, Boot (graceful shutdown is on by default) sets readiness to `REFUSING_TRAFFIC`, so the readiness group returns `OUT_OF_SERVICE`/503. The web server stops accepting new requests and gives in-flight ones up to `spring.lifecycle.timeout-per-shutdown-phase` to finish. Because endpoint propagation in Kubernetes is asynchronous, add a `preStop` sleep so the pod leaves the Service endpoints before Tomcat stops accepting. `terminationGracePeriodSeconds` must exceed preStop plus the shutdown timeout.
+</details>
+
+<details><summary>Q5. Explain Micrometer's architecture: MeterRegistry, the composite registry, dimensional metrics.</summary>
+
+Micrometer is a vendor-neutral facade, like SLF4J for metrics. You create meters (Counter, Timer, Gauge, DistributionSummary, LongTaskTimer) on a `MeterRegistry`. Each backend has a registry implementation (Prometheus, OTLP, Datadog...) with its own naming convention and push/pull model. Boot creates one registry per backend on the classpath and wraps several in a `CompositeMeterRegistry` (with exactly one, the bean is that registry itself). Meters are dimensional: name plus tags, so one metric has many series you can slice and aggregate. `MeterFilter`s can rename, deny, cap tags and configure histograms. `MeterBinder`s register meters for other components.
+</details>
+
+<details><summary>Q6. Percentiles vs histograms: which would you use for a fleet-wide p99 SLO?</summary>
+
+Histograms. `publishPercentiles` computes quantiles inside each JVM over a decaying window. You can't aggregate them across instances (averaging p99s is mathematically wrong), and you can't pick a different percentile later. `publishPercentileHistogram` emits cumulative `_bucket{le}` counters, which can be summed across pods and queried with `histogram_quantile(0.99, sum by (le)(rate(...[5m])))`. Add `serviceLevelObjectives(...)` buckets at your SLO thresholds so "% of requests under 500 ms" is exact. Trim the bucket range with min/max expected values to control series count.
+</details>
+
+<details><summary>Q7. What is the Observation API, and why does it exist?</summary>
+
+It's Micrometer's single instrumentation abstraction (Boot 3+). You start and stop an `Observation` with a name, a contextual name, and low/high-cardinality key values. Registered `ObservationHandler`s react: `DefaultMeterObservationHandler` records a timer and a long-task timer using the low-cardinality keys, and the tracing handlers create a span with all keys and propagate context. So you instrument once and get metrics *and* traces, instead of the old Micrometer + Sleuth double instrumentation. Spring Framework instruments MVC, WebFlux, RestClient, JMS, scheduling and more with it. You customize through `ObservationConvention`, `ObservationFilter`, `ObservationPredicate` and `management.observations.*` properties.
+</details>
+
+<details><summary>Q8. What's the difference between low- and high-cardinality key values? Give examples.</summary>
+
+Low-cardinality values come from a small bounded set (`method`, `status`, `outcome`, `tier`, `region`). They become metric tags and span attributes. High-cardinality values are unbounded (`order.id`, `user.id`, full URL). They are added only to spans, because every distinct tag value creates a new time series, and unbounded ones exhaust the metrics backend's memory. Spring tags HTTP metrics with the URI *template*, not the raw path, for this reason. Guard any client-controlled tag with `MeterFilter.maximumAllowableTags`.
+</details>
+
+<details><summary>Q9. How does a trace id travel from service A to service B?</summary>
+
+A's server instrumentation extracts the incoming `traceparent` (or starts a new trace) and puts the span in scope. When A calls B through an *instrumented* client (from the auto-configured `RestClient.Builder`, `WebClient.Builder` or `RestTemplateBuilder`), `PropagatingSenderTracingObservationHandler` creates a CLIENT span and the propagator injects `traceparent: 00-<traceId>-<clientSpanId>-<flags>`. B's receiver handler extracts it and creates a SERVER span with the same trace id and the client span as its parent. Across threads, the context moves through context-propagation (`ContextSnapshot`, task decorators). Over messaging, it moves as Kafka or JMS headers.
+</details>
+
+<details><summary>Q10. Head vs tail sampling: what's Boot's default?</summary>
+
+Head sampling decides at the root span and propagates the decision through the sampled flag. It's cheap, but blind to outcome. Boot's default probability is 0.1 (10%), with OTel's `parent-based-trace-id-ratio` sampler, so children honor the parent's decision. Tail sampling is done in the OTel Collector after a trace completes: you can keep all errors and slow traces and a small share of the rest. It costs buffering and needs trace-aware load balancing. Many teams combine a high head rate in the app with tail sampling in the collector.
+</details>
+
+<details><summary>Q11. Micrometer Tracing bridge vs the OpenTelemetry Java agent: when would you pick each?</summary>
+
+**Micrometer Tracing with the OTel bridge** (Boot's `spring-boot-starter-opentelemetry`) uses Spring's built-in Observation instrumentation, configured via Spring properties. One API gives metrics and traces, it is native-image friendly with no bytecode manipulation, and it is supported by the Spring team. It covers only what Spring and Micrometer instrument; for other libraries (raw JDBC, some clients) you add instrumentation.
+
+**The OTel Java agent** (`-javaagent:opentelemetry-javaagent.jar`) instruments hundreds of libraries automatically with zero code and is configured with `OTEL_*` env vars. It's good for polyglot platform teams and legacy apps. The costs: startup overhead, no GraalVM native image, possible duplicate spans or metrics if Spring's observations are also active, and version coupling to the libraries it patches.
+
+There is also the community **OTel Spring Boot starter** (from OTel, not Spring). Don't run the agent and Boot's tracing together without disabling one of them.
+</details>
+
+<details><summary>Q12. How do you get structured JSON logs with trace ids in Boot, and change log levels at runtime?</summary>
+
+Set `logging.structured.format.console=ecs` (or `logstash`, `gelf`, or a custom `StructuredLogFormatter`). Boot 3.4+ writes JSON, and every MDC entry, including the `traceId` and `spanId` that tracing puts there, becomes a field. Tune it with `logging.structured.json.*`. For runtime levels, `POST /actuator/loggers/com.acme {"configuredLevel":"DEBUG"}`. It changes the live `LoggingSystem` on that instance only and doesn't survive a restart. Reset it with `null`. Secure the endpoint.
+</details>
+
+<details><summary>Q13. Explain RED and USE, and how they map to Spring metrics.</summary>
+
+- **RED** (for request-driven services): Rate, Errors, Duration. All three come from `http_server_requests_seconds` (`_count` rate, `outcome="SERVER_ERROR"` ratio, histogram buckets for latency), and likewise `http.client.requests` for dependencies.
+- **USE** (for resources): Utilization, Saturation, Errors. Examples: CPU (`process_cpu_usage`), pools (`hikaricp_connections_active` vs `_max`, `hikaricp_connections_pending` for saturation, `executor_*`, `tomcat_threads_busy`), memory and GC (`jvm_memory_used_bytes`, `jvm_gc_pause_seconds`).
+
+Dashboards are typically RED per endpoint on top and USE per resource below.
+</details>
+
+<details><summary>Q14. What are SLIs, SLOs and error budgets? Write an alert.</summary>
+
+An **SLI** is a measured ratio of good events, e.g. "requests under 500 ms and not 5xx / all requests". An **SLO** is the target over a window, e.g. 99.9% over 30 days. The **error budget** is 1 − SLO (0.1%, about 43 minutes a month). Spend it on releases, and freeze risky changes when it's exhausted. Alert on **burn rate** rather than raw thresholds. For example, page if the 1-hour error ratio exceeds 14.4× the budget rate *and* the 5-minute one also does (multi-window, multi-burn-rate), which catches fast burns quickly without flapping. A simple Prometheus rule: `sum(rate(http_server_requests_seconds_count{outcome="SERVER_ERROR"}[5m])) / sum(rate(http_server_requests_seconds_count[5m])) > 0.05` with `for: 5m`. Alert on symptoms users feel, not on causes like CPU.
+</details>
+
+<details><summary>Q15. What changed for observability in Spring Boot 4?</summary>
+
+- A new `spring-boot-starter-opentelemetry` (OTel SDK, Micrometer bridge, OTLP exporters).
+- Modular `spring-boot-health` / `-micrometer-*` / `-opentelemetry` modules with new packages (e.g. `org.springframework.boot.health.contributor`).
+- Tests use `@AutoConfigureMetrics` and `@AutoConfigureTracing` instead of the removed `@AutoConfigureObservability`. Without them, there is no Prometheus endpoint, and tracing doesn't propagate or export.
+- `management.tracing.enabled` was renamed to `management.tracing.export.enabled`.
+- Liveness/readiness probes are on by default.
+- `@MeterTag` works on `@Timed`/`@Counted`.
+- The RestClient builder lives in `spring-boot-starter-restclient`.
+- OTel + Zipkin auto-configuration is deprecated, with removal in 4.2.
+- Versions: Micrometer 1.17 / Tracing 1.7 in Boot 4.1.
+</details>
+
+
