@@ -1,0 +1,38 @@
+# Build
+target/
+build/
+!**/src/main/**/target/
+!**/src/test/**/target/
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.sts4-cache/
+bin/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local env
+.env
+*.env
+!.env.example
+application-local.yml
+application-local.properties
+
+# Logs
+*.log
+logs/
+
+# Claude local overrides
+CLAUDE.local.md
+.claude/settings.local.json
