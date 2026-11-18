@@ -1,0 +1,6 @@
+# Loaded only when the dev profile is active. Profile-specific files beat application.yml.
+greeting:
+  template: "Hey %s, you are on dev"
+app:
+  support:
+    response-time: 15m

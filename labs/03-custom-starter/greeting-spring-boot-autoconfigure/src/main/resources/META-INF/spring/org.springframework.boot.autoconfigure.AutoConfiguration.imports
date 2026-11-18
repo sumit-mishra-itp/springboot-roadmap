@@ -1,0 +1,2 @@
+# One fully qualified class name per line. Read by ImportCandidates (spring.factories is no longer used for this).
+dev.roadmap.greeting.autoconfigure.GreetingAutoConfiguration

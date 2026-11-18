@@ -1,0 +1,2 @@
+# Boot 4 key (Boot 3 used org.springframework.boot.env.EnvironmentPostProcessor, now deprecated)
+org.springframework.boot.EnvironmentPostProcessor=dev.roadmap.demo.startup.RecordingEnvironmentPostProcessor

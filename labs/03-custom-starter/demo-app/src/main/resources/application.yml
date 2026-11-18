@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: demo-app
+  profiles:
+    group:
+      demo: dev, loud            # --spring.profiles.active=demo turns on dev AND loud
+
+greeting:
+  template: "Hello, %s!"
+
+app:
+  owner: ${APP_OWNER:platform-team}   # env var if set, else the default after ':'
+  instance-id: ${random.uuid}
+  support:
+    on-call-email: oncall@roadmap.dev
+    response-time: 4h                 # -> Duration.ofHours(4)
+    max-attachment-size: 10MB         # -> DataSize.ofMegabytes(10)
+
+---
+# A second document in the same file, active only for the prod profile.
+spring:
+  config:
+    activate:
+      on-profile: prod
+greeting:
+  template: "Good day, %s."

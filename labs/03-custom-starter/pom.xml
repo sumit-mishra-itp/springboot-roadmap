@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>4.1.2</version>
+		<relativePath/>
+	</parent>
+	<groupId>dev.roadmap</groupId>
+	<artifactId>custom-starter-parent</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<packaging>pom</packaging>
+	<name>custom-starter-parent</name>
+	<description>Lab 03/04: a custom auto-configuration + starter, and a demo app for profiles and externalized configuration</description>
+
+	<modules>
+		<module>greeting-spring-boot-autoconfigure</module>
+		<module>greeting-spring-boot-starter</module>
+		<module>demo-app</module>
+	</modules>
+
+	<properties>
+		<java.version>21</java.version>
+	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>dev.roadmap</groupId>
+				<artifactId>greeting-spring-boot-autoconfigure</artifactId>
+				<version>${project.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>dev.roadmap</groupId>
+				<artifactId>greeting-spring-boot-starter</artifactId>
+				<version>${project.version}</version>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+	<!-- No spring-boot-maven-plugin here: only demo-app is an executable jar.
+	     Libraries repackaged into BOOT-INF/classes could not be used as dependencies. -->
+</project>
