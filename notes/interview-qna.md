@@ -1436,3 +1436,85 @@ Better signals are:
 </details>
 
 
+
+## 13 — Reactive: WebFlux & R2DBC
+
+_From [notes/13-reactive/webflux.md](13-reactive/webflux.md)_
+
+
+<details><summary>Q1. What are the four Reactive Streams interfaces, and how does backpressure work?</summary>
+
+`Publisher` (`subscribe`), `Subscriber` (`onSubscribe`, `onNext`, `onError`, `onComplete`), `Subscription` (`request(n)`, `cancel()`), and `Processor` (both a Subscriber and a Publisher). After subscribing, the subscriber receives a `Subscription` and must call `request(n)` before any data flows. The publisher may emit at most the total requested. That demand signal flowing upstream is backpressure: a slow consumer simply requests less. `request(Long.MAX_VALUE)` means unbounded. Signals are serial, `null` is forbidden, and `onError`/`onComplete` are terminal. Java 9 copied the interfaces into `java.util.concurrent.Flow`.
+</details>
+
+<details><summary>Q2. Mono vs Flux, and what is the difference between assembly time and subscription time?</summary>
+
+`Mono` emits 0 or 1 item, `Flux` emits 0..N, and both then complete or error. Assembly time is when you chain operators: you build an immutable description, and nothing executes. Subscription time is when `subscribe()` is called: the subscription travels to the source, demand travels up, and data travels down. Consequences: `Mono.fromCallable` runs per subscriber, `Mono.just(expensive())` runs `expensive()` at assembly, and `switchIfEmpty(fallback())` builds its fallback eagerly unless wrapped in `Mono.defer`. The lab proves all three.
+</details>
+
+<details><summary>Q3. flatMap vs concatMap vs flatMapSequential?</summary>
+
+`flatMap` subscribes to inner publishers eagerly (default concurrency 256) and emits in completion order: fastest throughput, no ordering. `concatMap` subscribes to one inner at a time and waits for it to complete: it keeps order but total time is the sum. `flatMapSequential` subscribes eagerly but buffers results and emits them in source order: concurrency plus order, at the cost of memory. In the lab, inners delayed 300/100/200 ms give `1,2,3` after 300 ms, `3,1,2` after 600 ms, and `3,1,2` after 300 ms respectively.
+</details>
+
+<details><summary>Q4. publishOn vs subscribeOn?</summary>
+
+`subscribeOn` chooses the thread on which the subscription happens, so it moves the *source* and everything up to the first `publishOn`. Its position in the chain doesn't matter, and only the one closest to the source wins. `publishOn` switches the thread for all signals *below* it, so its position matters and you can use several. Typical use: `Mono.fromCallable(blockingCall).subscribeOn(Schedulers.boundedElastic())` to keep blocking work off the event loop.
+</details>
+
+<details><summary>Q5. Why must you never block the Netty event loop, and how do you call a blocking API from WebFlux?</summary>
+
+Reactor Netty runs roughly one event-loop thread per core, each serving thousands of connections. Blocking one of them stalls every connection on that loop, so throughput collapses to a handful of concurrent requests. Wrap the blocking call lazily in `Mono.fromCallable(...)` and add `.subscribeOn(Schedulers.boundedElastic())`, which is a bounded pool (10 × cores) meant for blocking work. Use BlockHound in tests to detect accidental blocking. If most of your calls are blocking, WebFlux is the wrong choice: use MVC with virtual threads.
+</details>
+
+<details><summary>Q6. Cold vs hot publishers? What do share() and cache() do?</summary>
+
+A cold publisher starts its work for each subscriber, from the beginning (HTTP calls, DB queries). A hot publisher emits regardless of subscribers, and late subscribers miss earlier data (sinks, tickers). `share()` (`publish().refCount()`) makes a cold source hot and shared: one upstream subscription while at least one subscriber exists. `cache()` makes it replay: the first subscriber triggers the work, and later subscribers get the stored signals, including errors. The lab proves that late `share()` subscribers miss elements and that `cache()` replays an error forever.
+</details>
+
+<details><summary>Q7. How do you do retries properly in Reactor?</summary>
+
+Use `retryWhen(Retry.backoff(n, firstDelay))` with a `filter` for transient errors only (timeouts, connection errors, 5xx, 429). Put `timeout` before `retryWhen` so each attempt gets its own deadline, and map non-retryable errors with `onErrorMap` before it. Exhaustion throws `RetryExhaustedException` (check with `Exceptions.isRetryExhausted`), which you can turn into a fallback with `onErrorResume`. Remember that retry resubscribes and re-runs the whole upstream, so only retry idempotent operations. Test it with `StepVerifier.withVirtualTime` so backoff delays don't slow the build.
+</details>
+
+<details><summary>Q8. How does error handling differ between Reactor and try/catch?</summary>
+
+An error is a terminal signal. After `onError`, the sequence is over, so `onErrorResume` *replaces* the rest of the sequence rather than continuing it. `onErrorReturn` gives a fallback value, `onErrorMap` translates the type, and `doOnError` only peeks. To skip a single bad element, recover inside the `flatMap` for that element. In WebFlux, `@ControllerAdvice` handles errors from annotated controllers only. A `WebExceptionHandler` handles everything, including functional endpoints and filters, which is why the lab uses one global `WebExceptionHandler` producing ProblemDetail.
+</details>
+
+<details><summary>Q9. Reactor Context vs ThreadLocal? How does MDC logging work in WebFlux?</summary>
+
+A `ThreadLocal` is tied to a thread, but a reactive request hops threads and threads interleave requests, so a `ThreadLocal` is lost or leaks. The Reactor `Context` is an immutable map tied to the subscription. You write it with `contextWrite` (visible upstream of the call) and read it with `deferContextual`. To keep `ThreadLocal`-based libraries working (MDC, tracing), Micrometer's context-propagation library registers `ThreadLocalAccessor`s, and with `spring.reactor.context-propagation=auto` (`Hooks.enableAutomaticContextPropagation()`) Reactor restores those `ThreadLocal`s from the Context around every operator. The default `limited` mode restores them only in `handle` and `tap`.
+</details>
+
+<details><summary>Q10. What does WebFlux look like inside, compared with Spring MVC?</summary>
+
+Netty receives the request. `ReactorHttpHandlerAdapter` adapts it to Spring's `HttpHandler`, and `HttpWebHandlerAdapter` creates a `ServerWebExchange`, runs the `WebExceptionHandler` and `WebFilter` chains, and calls `DispatcherHandler`. That finds a handler through `HandlerMapping`s (`RouterFunctionMapping`, `RequestMappingHandlerMapping`), invokes it through a `HandlerAdapter`, and writes the returned publisher with a `HandlerResultHandler`, using `Encoder`/`Decoder` codecs. MVC has the same shape with `DispatcherServlet`, servlet filters, and blocking `HttpMessageConverter`s, and its per-request state lives in `ThreadLocal`s.
+</details>
+
+<details><summary>Q11. What can't R2DBC do that JPA can? How do transactions work?</summary>
+
+No persistence context, no dirty checking, no lazy loading, no relationships or cascades, no schema generation, and no `Page` with an automatic COUNT. You save explicitly and compose related queries yourself. Transactions use `R2dbcTransactionManager`, either declaratively (`@Transactional` on a method returning the publisher) or programmatically with `TransactionalOperator.transactional(flux)`. The transaction is bound to the Reactor Context, not a `ThreadLocal`, and it rolls back on error *or cancellation*. Flyway still needs a JDBC driver.
+</details>
+
+<details><summary>Q12. WebClient vs RestClient: which do you choose in 2026?</summary>
+
+In a Spring MVC app, especially with virtual threads, use `RestClient`: synchronous, simple, and it scales because blocking a virtual thread is cheap. Use `WebClient` in WebFlux apps, for streaming responses (`bodyToFlux`, SSE), and when you need reactive composition with cancellation across many concurrent calls. Both back `@HttpExchange` interfaces. In Boot 4 they come from separate starters (`spring-boot-starter-webclient`, `spring-boot-starter-restclient`).
+</details>
+
+<details><summary>Q13. When should you NOT use reactive?</summary>
+
+For typical CRUD services on JDBC/JPA, when the team isn't fluent in Reactor, for CPU-bound work, or when key dependencies are blocking. Java 21 virtual threads give blocking code the I/O scalability that was reactive's main selling point, while keeping simple stack traces, `ThreadLocal`s, JPA, and the debugger. Reactive still wins for long-lived streaming (SSE/WebSocket), gateways and proxies, and complex fan-out with cancellation. The debugging and onboarding costs are real and continuous.
+</details>
+
+<details><summary>Q14. How do you handle a slow SSE client when broadcasting to thousands?</summary>
+
+Use a hot source that doesn't let one subscriber slow the others: `Sinks.many().multicast().directBestEffort()` drops elements only for subscribers without demand, whereas `share()`/`publish()` paces everyone to the slowest. Give each client its own bounded strategy: `onBackpressureLatest()` for prices, or `onBackpressureBuffer(n, DROP_OLDEST)`. Add heartbeats to keep proxies from closing the connection, send event ids so clients can resume with `Last-Event-ID`, and broadcast the feed to every node, because each node only owns its own connections.
+</details>
+
+<details><summary>Q15. How do you test reactive code?</summary>
+
+Use `StepVerifier` from reactor-test: `expectNext`, `expectError`, `verifyComplete`, `thenRequest` for backpressure, `thenCancel` for infinite streams, and `withVirtualTime` with `thenAwait` for delays and retries without waiting. Use `TestPublisher` to emit on demand. For HTTP, use `@WebFluxTest` with `WebTestClient` (slice) and `@SpringBootTest(RANDOM_PORT)` with `@AutoConfigureWebTestClient` (Boot 4) for the full stack. Use Testcontainers with `@ServiceConnection` for R2DBC (`testcontainers-r2dbc` provides the R2DBC connection details). Test SSE by taking `returnResult(...).getResponseBody()` into a `StepVerifier` and cancelling.
+</details>
+
+
