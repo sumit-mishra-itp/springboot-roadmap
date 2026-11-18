@@ -4,7 +4,8 @@ This is a Spring Boot 4 learning repo. It holds deep notes, small labs, and two 
 
 ## Commands
 Every project under `labs/` and `projects/` is standalone and has its own `mvnw`. Run commands from inside the project directory. Maven is not installed globally.
-- Build and run all tests: `./mvnw verify` (on Windows PowerShell: `.\mvnw.cmd verify`)
+- Build and run all tests: `./mvnw verify`
+- View the notes site from the repo root: `java -m jdk.httpserver -d "$PWD\notes" -p 3000`, then open http://localhost:3000. Use `npx docsify-cli serve notes` for live reload.
 - Run a single test: `./mvnw test -Dtest=OrderServiceTest` (single method: `-Dtest=OrderServiceTest#placesOrder`)
 - Run the app: `./mvnw spring-boot:run`
 - Start local infra: `docker compose up -d`
@@ -13,6 +14,7 @@ Every project under `labs/` and `projects/` is standalone and has its own `mvnw`
 
 ## Repo layout & workflow
 - `notes/NN-topic/`: one `.md` per topic. Every note follows `notes/_template.md` and fills all 10 sections, including at least one Mermaid diagram and at least one real-life architecture example.
+- `notes/` is also a Docsify site: `index.html` plus `_sidebar.md`. Add every new note to `_sidebar.md`. Link to labs and projects with absolute GitHub URLs (`https://github.com/sumit-mishra-itp/springboot-roadmap/tree/main/labs/...`) so the links work both on GitHub and on the site.
 - `labs/NN-topic/`: one standalone app per topic. Create it with Spring Initializr when the phase starts, not before:
   `curl https://start.spring.io/starter.zip -d type=maven-project -d bootVersion=<current 4.x> -d javaVersion=21 -d dependencies=... -o lab.zip`
 - `projects/`: the two capstones. Each is self-contained (its own mvnw and README, no shared parent pom) so it can be split into its own repo later.
@@ -67,7 +69,7 @@ Every project under `labs/` and `projects/` is standalone and has its own `mvnw`
 - Name tests by behavior, e.g. `placesOrder_whenStockAvailable`, and follow given/when/then.
 
 ## Gotchas
-- The PowerShell shell on this machine can't run `./mvnw`. Use `.\mvnw.cmd`, or use Git Bash.
+- Lifecycle facts must be proven by a test before they go in a note. An example claim that turned out wrong: "@PostConstruct runs before custom BeanPostProcessors" (see lab 01 `LifecycleOrderTest`).
 - `python` is not installed. Use PowerShell `Invoke-RestMethod` / `ConvertFrom-Json` for JSON.
 - Boot 4 uses Jackson 3, whose packages are `tools.jackson.*`. Annotations stay in `com.fasterxml.jackson.annotation`.
 - Boot 4 has modular starters, so some auto-configs that used to come transitively now need an explicit starter (for example `spring-boot-starter-webmvc-test` for MVC test slices). Check the migration guide when a slice or auto-config seems to be missing.

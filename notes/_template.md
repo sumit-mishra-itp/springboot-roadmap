@@ -1,6 +1,6 @@
 # NN — Topic Name
 
-> **Lab:** [`labs/NN-topic`](../../labs/NN-topic) · **Capstone use:** _feature it powers_ · **Prereqs:** _notes to read first_
+> **Lab:** [`labs/NN-topic`](https://github.com/sumit-mishra-itp/springboot-roadmap/tree/main/labs/NN-topic) · **Capstone use:** _feature it powers_ · **Prereqs:** _notes to read first_
 
 ## 1. What & why
 - What problem it solves and what people did before it existed.

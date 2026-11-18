@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spring Boot Roadmap</title>
+  <meta name="description" content="Deep, self-contained Spring Boot 4 notes with diagrams, internals and interview Q&A">
+  <!-- Light/dark follows the OS setting -->
+  <link rel="stylesheet" media="(prefers-color-scheme: light)" href="https://cdn.jsdelivr.net/npm/docsify-themeable@0.9.0/dist/css/theme-simple.css">
+  <link rel="stylesheet" media="(prefers-color-scheme: dark)" href="https://cdn.jsdelivr.net/npm/docsify-themeable@0.9.0/dist/css/theme-simple-dark.css">
+  <style>
+    :root { --base-font-size: 16px; --content-max-width: 60em; --sidebar-width: 19rem; }
+    .markdown-section table { display: table; width: 100%; }
+    .markdown-section details { margin: .5em 0; padding: .5em .8em; border: 1px solid var(--table-cell-border-color, #ddd); border-radius: 6px; }
+    .markdown-section summary { cursor: pointer; font-weight: 600; }
+    .mermaid { text-align: center; margin: 1em 0; }
+  </style>
+</head>
+<body>
+  <div id="app">Loading notes…</div>
+  <script>
+    window.$docsify = {
+      name: 'springboot-roadmap',
+      repo: 'https://github.com/sumit-mishra-itp/springboot-roadmap',
+      loadSidebar: true,
+      subMaxLevel: 2,
+      auto2top: true,
+      relativePath: true,
+      search: { depth: 3, placeholder: 'Search notes', noData: 'No results' },
+      pagination: { crossChapter: true, crossChapterText: true },
+      copyCode: { buttonText: 'Copy' },
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/docsify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/plugins/search.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-themeable@0.9.0/dist/js/docsify-themeable.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-copy-code@2.1.2/dist/docsify-copy-code.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-pagination@2.10.1/dist/docsify-pagination.min.js"></script>
+  <!-- Syntax highlighting for the languages used in notes -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-properties.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-docker.min.js"></script>
+  <!-- Mermaid diagrams -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
+    });
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-mermaid@2.0.1/dist/docsify-mermaid.js"></script>
+</body>
+</html>
