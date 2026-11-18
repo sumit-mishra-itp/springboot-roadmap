@@ -45,7 +45,7 @@ projects/   two capstone projects (resume-grade)
 
 ## Phase B — Advanced
 
-- [ ] 08 Testing: slices, `@MockitoBean`, Testcontainers, `@ServiceConnection`, RestTestClient
+- [x] 08 Testing: slices, `@MockitoBean`, Testcontainers, `@ServiceConnection`, RestTestClient
 - [x] 09 Caching + Redis: cache abstraction, TTL, cache-aside, stampede (lab `09-redis-cache`)
 - [x] 10 Observability: Actuator, Micrometer, OpenTelemetry, Prometheus/Grafana (lab `10-observability`)
 - [ ] 11 Messaging with Kafka: retries, DLT, idempotency, outbox (lab `11-kafka`)

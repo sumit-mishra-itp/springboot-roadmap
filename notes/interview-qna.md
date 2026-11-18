@@ -1291,3 +1291,148 @@ Non-`Async` callbacks run on the thread that completes the future (the worker), 
 </details>
 
 
+
+## 08 — Testing
+
+_From [notes/08-testing/testing.md](08-testing/testing.md)_
+
+
+<details><summary>Q1. How does the Spring TestContext framework decide whether two test classes share an ApplicationContext?</summary>
+
+It builds a `MergedContextConfiguration` for each class and uses it as the key into a static, JVM-wide `DefaultContextCache`. The key contains:
+- the configuration classes and locations;
+- the context initializers;
+- the context loader;
+- the parent context;
+- active profiles;
+- `@TestPropertySource` locations and inlined properties;
+- the resource base path;
+- every `ContextCustomizer`, which includes `@MockitoBean`/`@MockitoSpyBean`/`@TestBean` overrides, `@DynamicPropertySource` methods and Boot's customizers.
+
+If the keys are equal, the context is reused. JVM system properties and environment variables are *not* part of the key. The cache holds 32 contexts by default and evicts the least recently used one. In lab 06, seven classes and 49 tests started only three contexts.
+</details>
+
+<details><summary>Q2. Why can @MockitoBean make a test suite slow, and how do you avoid it?</summary>
+
+Each bean override is a context customizer, so a different set of mocked beans (even a different *field name*, which acts as a fallback qualifier) is a different cache key. That means a new context, and with Testcontainers often a new container. Avoid it as follows:
+- Declare shared mocks once, on a base class or in a composed annotation (`@MockitoBean(types = {...})`).
+- Name mock fields consistently.
+- Prefer slices that need few mocks.
+- Prefer real lightweight collaborators where possible: lab 05 imports the in-memory repository instead of mocking it.
+</details>
+
+<details><summary>Q3. What replaced @MockBean in Boot 4, and how does it differ?</summary>
+
+`@MockBean`/`@SpyBean` were removed. Spring Framework's `@MockitoBean`/`@MockitoSpyBean` replace them.
+- `@MockitoBean` uses the `REPLACE_OR_CREATE` strategy: it creates the bean if none exists. Set `enforceOverride = true` to require an existing bean.
+- `@MockitoSpyBean` uses `WRAP` and needs exactly one candidate bean.
+- They can be used on test-class fields (including superclasses and enclosing classes of `@Nested`) or at type level with `types`. They cannot be used in `@Configuration` classes.
+- A `@MockitoBean` is registered as a manual singleton, so it has **no AOP proxy**. A spy keeps the existing proxy.
+- Since Framework 7, overrides also work on non-singleton beans.
+</details>
+
+<details><summary>Q4. Explain the @SpringBootTest webEnvironment modes and their transaction semantics.</summary>
+
+- `MOCK` (default): no server, a mock servlet environment. Combine it with `@AutoConfigureMockMvc`.
+- `RANDOM_PORT`: a real embedded server on a free port.
+- `DEFINED_PORT`: a real server on `server.port` or 8080.
+- `NONE`: no web environment.
+
+A `@Transactional` test method rolls back at the end. With a *real* server, though, the HTTP request runs on a server thread in its own transaction, which commits and is not rolled back. So `RANDOM_PORT` tests must clean up or assert relative counts, as lab 05's `RestApiApplicationTests.totalBooks()` does.
+</details>
+
+<details><summary>Q5. What does Boot 4 change for MockMvc, TestRestTemplate and WebTestClient in @SpringBootTest?</summary>
+
+None of them is provided automatically any more:
+- Add `@AutoConfigureMockMvc` for `MockMvc`/`MockMvcTester`.
+- Add `@AutoConfigureTestRestTemplate` for `TestRestTemplate`, which moved to `org.springframework.boot.resttestclient` and also needs `spring-boot-restclient`.
+- Add `@AutoConfigureWebTestClient` for `WebTestClient`.
+
+The recommended blocking client is the new Framework 7 `RestTestClient` with `@AutoConfigureRestTestClient`. It can target a live server, a controller, or the context via MockMvc. Labs 05, 07 and 10 use it with `RANDOM_PORT`.
+</details>
+
+<details><summary>Q6. How does a test slice like @WebMvcTest work internally?</summary>
+
+It is a composed annotation with these parts:
+- `@BootstrapWith(WebMvcTestContextBootstrapper)`;
+- `@ExtendWith(SpringExtension)`;
+- `@OverrideAutoConfiguration(enabled = false)`, which turns off all auto-configuration;
+- `@TypeExcludeFilters(WebMvcTypeExcludeFilter)`, which restricts scanning to web components such as controllers, advice, `WebMvcConfigurer` and `Filter`;
+- `@ImportAutoConfiguration`, which re-enables only the auto-configs listed in the module's `META-INF/spring/...AutoConfigureWebMvc.imports` and `...AutoConfigureMockMvc.imports`.
+
+`@Service`, `@Repository` and `@Configuration` classes are not loaded. You supply them with `@Import`, fakes, or `@MockitoBean`, as labs 05 and 07 do.
+</details>
+
+<details><summary>Q7. When would you use ApplicationContextRunner instead of @SpringBootTest?</summary>
+
+When testing auto-configuration or a small set of infrastructure beans. It creates a fresh, tiny context per `run(...)`, without component scanning and without the TestContext cache. That makes property, classpath (`FilteredClassLoader`) and user-bean variations cheap, and it gives AssertJ assertions such as `hasSingleBean`, `doesNotHaveBean` and `hasFailed`. Examples:
+- Lab 03 tests every condition of its starter this way.
+- Lab 12 tests `@Async` and `@Scheduled` against Boot's real `TaskExecutionAutoConfiguration`/`TaskSchedulingAutoConfiguration` in milliseconds.
+</details>
+
+<details><summary>Q8. How do you use Testcontainers with Spring Boot, and why are container beans preferred over static @Container fields?</summary>
+
+Declare the container as a `@Bean` with `@ServiceConnection` in a top-level `@TestConfiguration`, and `@Import` it into tests. Boot then creates a `ConnectionDetails` bean that overrides `spring.datasource.*` or the equivalent properties. Container beans start before all other beans and stop after them, so they live exactly as long as the cached context.
+
+Static `@Container` fields are stopped by the JUnit extension after the test class. The cached context outlives the container, so a later class that reuses the context hits a dead port. For a `GenericContainer`, give `@ServiceConnection(name = "redis")`, as lab 09 does.
+</details>
+
+<details><summary>Q9. What is context pausing in Spring Framework 7?</summary>
+
+A cached context that is not in use can be paused: all `Lifecycle`/`SmartLifecycle` beans are stopped, such as schedulers and message listener containers. It is restarted when a test retrieves it again. This stops background work in idle cached contexts from interfering with other tests.
+- Control it with the `spring.test.context.cache.pause` property: `always`, `on_context_switch` (the default since 7.0.3) or `never`.
+- A `SmartLifecycle` bean can opt out with `isPauseable() = false`.
+</details>
+
+<details><summary>Q10. How do you test JWT-secured endpoints at different levels?</summary>
+
+- **Slice level.** Use `@WebMvcTest` with the real `SecurityConfig` imported, plus `jwt()` or `@WithMockUser`. This tests URL and method authorization rules quickly. But `jwt()` builds a `JwtAuthenticationToken` directly, skipping the `JwtDecoder` and your `JwtAuthenticationConverter`, so you must pass authorities explicitly.
+- **End-to-end level.** Use `RANDOM_PORT`, log in, and send real bearer tokens. This proves decoding and claim-to-role mapping, and that no session is created.
+
+Also import the real secured service rather than mocking it, or the method-security proxy disappears. Lab 07 does all of this.
+</details>
+
+<details><summary>Q11. Mock vs stub vs spy vs fake, and what does "don't mock what you don't own" mean?</summary>
+
+- A stub returns canned answers.
+- A mock also verifies interactions.
+- A spy wraps a real object and overrides selected calls.
+- A fake is a working, simplified implementation, such as an in-memory repository.
+
+"Don't mock what you don't own": mocking a third-party API (`RestClient`, `EntityManager`, a Redis template) encodes your *assumptions* about it, which the mock can never falsify. Wrap the library in your own adapter, mock the adapter in unit tests, and test the adapter itself against the real thing (Testcontainers, `MockRestServiceServer`, WireMock).
+</details>
+
+<details><summary>Q12. How do you test asynchronous behavior without flakiness?</summary>
+
+- Never `Thread.sleep`. Use Awaitility: `await().atMost(Duration.ofSeconds(5)).until(condition)`. It polls and returns as soon as the condition holds (labs 09, 10, 12).
+- For races, line threads up behind a start-gate `CountDownLatch` and release them together (lab 05 `IdempotencyStoreTest`, lab 06 `LockingTest`).
+- For reactive code, use `StepVerifier.withVirtualTime(() -> publisher)` and `thenAwait(...)`. Create the publisher inside the supplier, and start with `expectSubscription()` before `expectNoEvent`.
+- For time-based logic, inject a `Clock`.
+</details>
+
+<details><summary>Q13. Can you run Spring integration tests in parallel?</summary>
+
+JUnit Jupiter supports opt-in in-JVM parallelism (`junit.jupiter.execution.parallel.enabled=true`, with class and method modes). Spring's docs say not to use it for tests that use `@DirtiesContext`, `@MockitoBean`/`@MockitoSpyBean`, or `@TestMethodOrder`, or that change shared state such as a database or broker. That rules out most integration suites, including labs 05, 06, 09 and 12.
+
+The safer option is process-level parallelism: Surefire `forkCount`, or CI sharding. Each fork has its own context cache and containers. First, though, cut the number of contexts and push tests down to slices.
+</details>
+
+<details><summary>Q14. What is consumer-driven contract testing, and how does it differ from end-to-end testing?</summary>
+
+The consumer states the interactions it relies on. The provider runs those contracts as tests in its own pipeline. The consumer tests against stubs generated from the *verified* contract (Spring Cloud Contract stub jars, or Pact mock servers with a broker and `can-i-deploy`). This catches breaking API changes, such as a renamed field, before deployment, without standing up both services.
+
+End-to-end tests check that deployed services work together, but they are slow, flaky, and hard to debug. Contracts replace most of them. A thin post-deploy smoke test stays.
+</details>
+
+<details><summary>Q15. Coverage is 90%. Is the suite good? How would you know?</summary>
+
+Not necessarily. Coverage shows which lines *executed*, not which behaviors are *asserted*. A test with no assertions still yields coverage. Mutation testing (PIT) seeds small bugs and checks whether any test fails. Surviving mutants show code that is covered but not tested.
+
+Better signals are:
+- the mutation score on core logic;
+- diff coverage on pull requests;
+- the flaky-test rate;
+- how often production bugs had no failing test.
+</details>
+
+
