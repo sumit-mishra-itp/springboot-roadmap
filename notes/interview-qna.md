@@ -726,3 +726,87 @@ In Boot 4 the starters are renamed `spring-boot-starter-security-oauth2-*`.
 </details>
 
 
+
+## 06 — Data JPA & Hibernate
+
+_From [notes/06-data-jpa/jpa-hibernate.md](06-data-jpa/jpa-hibernate.md)_
+
+
+<details><summary>Q1. What is the difference between JPA, Hibernate and Spring Data JPA?</summary>
+
+**JPA** (Jakarta Persistence 3.2) is a *specification*: annotations and interfaces (`EntityManager`, `@Entity`, JPQL) with no implementation. **Hibernate** is a JPA *provider*: it implements `EntityManager` with its `Session`, generates SQL, does dirty checking and caching, and adds extras (`@BatchSize`, `@SoftDelete`, HQL). **Spring Data JPA** sits on top: it generates repository implementations from interfaces (`SimpleJpaRepository` plus query derivation) and integrates with Spring transactions. Between them, **Spring ORM** provides `JpaTransactionManager`, the shared `EntityManager` proxy, and exception translation into `DataAccessException`.
+</details>
+
+<details><summary>Q2. How does a repository interface with no implementation work at runtime?</summary>
+
+`JpaRepositoriesRegistrar` registers a `JpaRepositoryFactoryBean` for each repository interface. The factory creates a JDK proxy whose target is a `SimpleJpaRepository` (for CRUD methods), with advice for exception translation, transactions, and a `QueryExecutorMethodInterceptor` for custom methods. Each custom method is resolved at startup by the lookup strategy: `@Query` first, then a named query, then derivation from the method name with `PartTree`. Errors therefore fail at startup. `SimpleJpaRepository` is `@Transactional(readOnly = true)` at class level, and its write methods override that with `@Transactional`.
+</details>
+
+<details><summary>Q3. Explain the entity lifecycle states.</summary>
+
+**Transient:** `new`, unknown to JPA. **Managed:** in a persistence context, and changes are tracked and flushed. **Detached:** it was managed, but the context closed (the transaction ended, or `clear`/`detach`), so changes are ignored and lazy loads fail. **Removed:** scheduled for DELETE at flush. `persist` makes a transient entity managed. `merge` copies a detached entity's state onto a managed instance and *returns* that instance (the argument stays detached). `remove` marks a managed entity for deletion.
+</details>
+
+<details><summary>Q4. What is dirty checking, and when is SQL actually executed?</summary>
+
+When an entity is loaded, Hibernate stores a snapshot of its state. At **flush**, it compares every managed entity to its snapshot and generates UPDATEs for the differences, so you never call `update()`, and calling `save()` on a managed entity is redundant. Flush happens before commit, before queries that touch affected tables (`FlushModeType.AUTO`), or on an explicit `flush()`. The action queue runs inserts, then updates, then collection changes, and deletes last. In a `readOnly` Spring transaction the flush mode is `MANUAL`, so changes are never written.
+</details>
+
+<details><summary>Q5. What is the N+1 problem, and how do you detect and fix it?</summary>
+
+Loading N parents with one query and then touching a lazy association on each fires N more queries. Detect it by counting statements (Hibernate `Statistics.getPrepareStatementCount()`, datasource-proxy or p6spy in tests), not by reading code. Fixes: a `JOIN FETCH` or `@EntityGraph` for that use case (1 query), `@BatchSize` / `hibernate.default_batch_fetch_size` as a global safety net (1 + N/size), `SUBSELECT` fetching, or a DTO projection that loads no entities at all. Watch for `MultipleBagFetchException` with two `List`s, and for pagination combined with a collection fetch join.
+</details>
+
+<details><summary>Q6. What are the default fetch types, and why should every association be LAZY?</summary>
+
+`@ManyToOne` and `@OneToOne` are **EAGER** by default. `@OneToMany`, `@ManyToMany` and `@ElementCollection` are LAZY. An EAGER to-one is loaded on every `find` and causes an extra SELECT per distinct parent after every JPQL query, which is N+1 even if you never use it, and you can't turn EAGER off per query. LAZY plus an explicit fetch plan per use case (entity graph or fetch join) gives you control. One niche exception: a LAZY to-one pointing at an entity with `@SoftDelete` is still loaded eagerly, because Hibernate must know whether the target counts as deleted.
+</details>
+
+<details><summary>Q7. Owning side vs inverse side: what does mappedBy do?</summary>
+
+The owning side is the one that maps the foreign key (`@ManyToOne` with `@JoinColumn`, or the `@ManyToMany` side without `mappedBy`). Hibernate writes the FK based **only** on the owning side. `mappedBy` marks the inverse side (`@OneToMany(mappedBy = "customer")`), which is a read-only mirror: adding an order only to `customer.getOrders()` writes nothing. Keep both sides in sync with helper methods. A unidirectional `@OneToMany` without `mappedBy` creates a join table (or extra UPDATEs with `@JoinColumn`).
+</details>
+
+<details><summary>Q8. Explain @Transactional internals. Why doesn't it work on self-invocation or private methods?</summary>
+
+`@EnableTransactionManagement` registers an advisor whose `TransactionInterceptor` wraps bean methods in a proxy. On a call, `TransactionAspectSupport.invokeWithinTransaction` reads the attributes, calls `PlatformTransactionManager.getTransaction` (`JpaTransactionManager` creates an `EntityManager`, begins the transaction, and binds the `EntityManager` and JDBC connection to the thread via `TransactionSynchronizationManager`), invokes the method, and then commits or calls `completeTransactionAfterThrowing`. Self-invocation (`this.method()`) never reaches the proxy. Private and final methods can't be overridden by CGLIB. Protected and package-private methods **do** work since Framework 6.0 with class-based proxies.
+</details>
+
+<details><summary>Q9. List the propagation types. When would you use REQUIRES_NEW, and what is the risk?</summary>
+
+`REQUIRED` (join or create), `REQUIRES_NEW` (suspend and create an independent transaction), `SUPPORTS`, `NOT_SUPPORTED`, `MANDATORY` (throw if none), `NEVER` (throw if one exists), and `NESTED` (a savepoint; not enabled by default with `JpaTransactionManager`). Use `REQUIRES_NEW` for audit or attempt logs that must persist even if the business transaction rolls back. Risks: it needs a **second connection** while the first is held, which can deadlock a small pool under load, and its commit is independent, so an outer rollback doesn't undo it.
+</details>
+
+<details><summary>Q10. Which exceptions roll back a transaction by default? What is UnexpectedRollbackException?</summary>
+
+`RuntimeException` and `Error` roll back. **Checked exceptions commit.** Change that with `rollbackFor`/`noRollbackFor`, or globally with `@EnableTransactionManagement(rollbackOn = ALL_EXCEPTIONS)` (Framework 6.2+). `UnexpectedRollbackException` happens when an inner `REQUIRED` method throws (marking the shared transaction rollback-only), the outer method catches it and returns normally, and the commit then discovers the rollback-only flag.
+</details>
+
+<details><summary>Q11. Optimistic vs pessimistic locking, and how do isolation levels relate to lost updates?</summary>
+
+**Optimistic** (`@Version`): no DB lock is held. Each UPDATE adds `WHERE version = ?` and increments it, so 0 rows means a conflict → `ObjectOptimisticLockingFailureException`. Retry the whole transaction or report a 409. It's best when conflicts are rare and for long "think time" edits across HTTP requests (expose the version as an ETag). **Pessimistic** (`@Lock(PESSIMISTIC_WRITE)` → `SELECT ... FOR NO KEY UPDATE` on Postgres with Hibernate 7.4) blocks other writers until commit. It's best when conflicts are frequent and retries are costly. It costs lock waits, held connections and deadlock risk, so keep transactions short and use `lock.timeout`/NOWAIT. For a single hot counter, an atomic `UPDATE ... SET stock = stock - 1 WHERE stock > 0` beats both.
+
+**Isolation levels:** `READ_UNCOMMITTED` allows dirty reads. `READ_COMMITTED` (the Postgres/Oracle/SQL Server default) prevents dirty reads but allows non-repeatable reads, phantoms and lost updates. `REPEATABLE_READ` (the MySQL default; snapshot isolation in Postgres) prevents non-repeatable reads, and Postgres also prevents phantoms but allows write skew. `SERIALIZABLE` prevents everything, and Postgres SSI throws serialization failures you must retry. Most apps stay on READ COMMITTED and prevent lost updates with `@Version` or row locks rather than raising the isolation level.
+</details>
+
+<details><summary>Q12. What is Open Session in View, and why do we disable it?</summary>
+
+`OpenEntityManagerInViewInterceptor` keeps the `EntityManager` open for the entire web request, so lazy associations can load during JSON serialisation or view rendering. Boot enables it by default and logs a warning. Problems: a connection is held for the whole request, lazy loads run outside transactions (auto-commit, N+1 hidden in the view layer), and data-access decisions leak out of the service layer. With `spring.jpa.open-in-view=false`, a lazy access after the service returns throws `LazyInitializationException`, which forces the service to fetch exactly what the use case needs or to return DTOs.
+</details>
+
+<details><summary>Q13. Why does IDENTITY disable batch inserts? Which ID strategy should you use?</summary>
+
+With `IDENTITY` the database assigns the id during the INSERT, and Hibernate needs the id immediately to put the entity into the persistence context. So each `persist()` executes its own INSERT right away, and nothing can be grouped into a JDBC batch. `SEQUENCE` with a pooled optimizer (`allocationSize = 50` matching `INCREMENT BY 50`) fetches ids in blocks without inserting, so inserts are queued and sent in batches (`hibernate.jdbc.batch_size`, `order_inserts`). In the lab, 40 IDENTITY inserts take 40 statements and 40 SEQUENCE inserts take 4 or fewer. For distributed ids, UUIDv7 (`@UuidGenerator(style = VERSION_7)`) keeps inserts index-friendly.
+</details>
+
+<details><summary>Q14. How do you implement equals/hashCode on an entity?</summary>
+
+Never base `hashCode` on a generated id: it changes when `persist()` assigns the id, so the entity gets lost in a `HashSet` (the lab proves `contains()` returns false for the same object). Options: use an immutable business key (`sku`, `email`); or use id-equality only when the id is non-null, plus a **constant** `hashCode` (`getClass()` or the entity class's hash); or assign a UUID in the constructor. Use `instanceof` and getters so Hibernate proxies compare correctly, and never use Lombok `@Data` on entities.
+</details>
+
+<details><summary>Q15. Page vs Slice vs Window (keyset): what does each cost?</summary>
+
+`Page` runs the content query plus a `count(*)` (skipped when the total is obvious, e.g. a partial last page), so it's the right fit when the UI shows "page 3 of 120". `Slice` fetches `size + 1` rows and never counts, which suits infinite scroll. Both use `OFFSET`, which costs O(offset) and can skip or duplicate rows when data changes between requests. `Window` with `ScrollPosition.keyset()` filters `WHERE (sort keys) > (last seen)`. It costs the same at any depth and stays correct under inserts and deletes, but it needs a unique, stable sort and offers no "jump to page N".
+</details>
+
+
