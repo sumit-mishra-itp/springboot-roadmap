@@ -4,6 +4,10 @@
   - [01 Spring Core: IoC & DI](01-core/spring-core.md)
   - [02 AOP: proxies & aspects](02-aop/spring-aop.md)
   - [03 Boot internals: auto-configuration](03-boot-internals/auto-configuration.md)
+  - [04 Configuration & profiles](04-configuration/externalized-config.md)
+  - [05 Web MVC & REST APIs](05-web-mvc-rest/rest-apis.md)
+  - [06 Data JPA & Hibernate](06-data-jpa/jpa-hibernate.md)
+  - [07 Spring Security 7](07-security/spring-security.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)

@@ -37,8 +37,8 @@ projects/   two capstone projects (resume-grade)
 - [x] 00 Java 21 refresher: records, sealed types, pattern matching, streams, Optional, virtual threads
 - [x] 01 Spring Core: IoC, DI, bean scopes and lifecycle, `@Configuration`, BeanPostProcessor, events (lab `01-core-ioc`)
 - [x] 02 AOP: JDK vs CGLIB proxies, advice, pointcuts, self-invocation (lab `02-aop-logging`)
-- [ ] 03 Boot internals: starters, auto-configuration, `@Conditional*`, modular starters in Boot 4 (lab `03-custom-starter`)
-- [ ] 04 Configuration: YAML, profiles, `@ConfigurationProperties`, property precedence
+- [x] 03 Boot internals: starters, auto-configuration, `@Conditional*`, modular starters in Boot 4 (lab `03-custom-starter`)
+- [x] 04 Configuration: YAML, profiles, `@ConfigurationProperties`, property precedence
 - [ ] 05 Web MVC / REST: DispatcherServlet, validation, `ProblemDetail`, API versioning, OpenAPI (lab `05-rest-api`)
 - [ ] 06 Data JPA / Hibernate: relationships, N+1, projections, transactions, locking, Flyway (lab `06-jpa-deep-dive`)
 - [ ] 07 Spring Security 7: filter chain, authN/authZ, method security, JWT, OAuth2 (lab `07-security-jwt`)

@@ -375,3 +375,221 @@ A proxied call walks the interceptor list held by `ReflectiveMethodInvocation` a
 </details>
 
 
+
+## 03 — Boot internals: auto-configuration
+
+_From [notes/03-boot-internals/auto-configuration.md](03-boot-internals/auto-configuration.md)_
+
+
+<details><summary>Q1. What does @SpringBootApplication do?</summary>
+
+It is a composed annotation with three parts:
+- `@SpringBootConfiguration`, a `@Configuration` that test slices look up to find the app.
+- `@EnableAutoConfiguration`, which imports `AutoConfigurationImportSelector` and registers the base package through `@AutoConfigurationPackage` (used by entity scanning and Spring Data).
+- `@ComponentScan` from the class's package, with `TypeExcludeFilter` and `AutoConfigurationExcludeFilter`.
+
+Its attributes `exclude`, `excludeName`, `scanBasePackages` and `proxyBeanMethods` are aliases for those parts.
+</details>
+
+<details><summary>Q2. How does Spring Boot find auto-configuration classes?</summary>
+
+`AutoConfigurationImportSelector` calls `ImportCandidates.load(AutoConfiguration.class, classLoader)`, which reads every `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` on the classpath. Then it:
+1. removes duplicates and exclusions (`exclude`, `spring.autoconfigure.exclude`);
+2. runs a fast filter (`OnClassCondition`, `OnBeanCondition`, `OnWebApplicationCondition`) driven by the precomputed `spring-autoconfigure-metadata.properties`;
+3. sorts the rest (`@AutoConfigureOrder`, `before`/`after`);
+4. hands them to the configuration-class parser for full condition evaluation.
+
+`spring.factories` stopped being used for this in Boot 3.0.
+</details>
+
+<details><summary>Q3. Why does a user-defined bean always win over an auto-configured one?</summary>
+
+`AutoConfigurationImportSelector` is a `DeferredImportSelector`, so auto-configurations are parsed only after all user configuration and component-scanned classes. When an auto-config's `@ConditionalOnMissingBean` is evaluated (in the `REGISTER_BEAN` phase), the user's bean definition already exists, so the auto-config backs off. The flip side: `@ConditionalOnBean` in user config can't see auto-configured beans.
+</details>
+
+<details><summary>Q4. List the main @Conditional annotations Boot provides.</summary>
+
+- **Classpath:** `@ConditionalOnClass` / `OnMissingClass`.
+- **Beans:** `@ConditionalOnBean` / `OnMissingBean` / `OnSingleCandidate` / `OnMissingFilterBean`.
+- **Properties:** `@ConditionalOnProperty` / `OnBooleanProperty`.
+- **Environment:** `@ConditionalOnResource`, `@ConditionalOnWebApplication` / `OnNotWebApplication`, `@ConditionalOnWarDeployment` / `OnNotWarDeployment`, `@ConditionalOnCloudPlatform`, `@ConditionalOnJava`, `@ConditionalOnJndi`, `@ConditionalOnThreading`, `@ConditionalOnCheckpointRestore`.
+- **Escape hatch:** `@ConditionalOnExpression`.
+
+Spring's `@Profile` is also a condition.
+</details>
+
+<details><summary>Q5. What is the difference between @AutoConfigureOrder and @AutoConfiguration(after = ...)?</summary>
+
+`after`/`before` express a relative dependency between two specific auto-configs. Use them when one's conditions need the other's beans. `@AutoConfigureOrder` is an absolute priority, like `@Order` but only among auto-configs, for classes that shouldn't know each other. Both affect only bean-definition registration order, not bean creation order.
+</details>
+
+<details><summary>Q6. How do you find out why an auto-configuration did or didn't apply?</summary>
+
+- Start with `--debug` (or `debug=true`) to print the Conditions Evaluation Report: positive matches, negative matches with the failing condition's message, exclusions, and unconditional classes.
+- In a running app, use `/actuator/conditions`.
+- In tests, use `ConditionEvaluationReport.get(beanFactory)` or `ConditionEvaluationReportLoggingListener` on an `ApplicationContextRunner`.
+</details>
+
+<details><summary>Q7. How would you build a custom starter?</summary>
+
+- **Auto-configure module:** your `@AutoConfiguration` classes with `@ConditionalOnClass`, `@ConditionalOnMissingBean` and property conditions, and an `@ConfigurationProperties` record under your own prefix (validated). List the classes in `META-INF/spring/...AutoConfiguration.imports`, make library dependencies `optional`, and add `spring-boot-configuration-processor` and `spring-boot-autoconfigure-processor`.
+- **Starter module:** a pom-only artifact depending on the auto-configure module, `spring-boot-starter`, and the libraries.
+- **Naming:** `acme-spring-boot-starter`, never `spring-boot-...`.
+- **Tests:** `ApplicationContextRunner` for each condition, `FilteredClassLoader` for missing classes, and `withUserConfiguration` to prove back-off.
+</details>
+
+<details><summary>Q8. Walk through SpringApplication.run().</summary>
+
+1. Create the bootstrap context (run `BootstrapRegistryInitializer`s), then `ApplicationStartingEvent`.
+2. Prepare the `Environment`: command-line args, then `ApplicationEnvironmentPreparedEvent`, during which `EnvironmentPostProcessor`s run and `application.yml` and profiles are loaded. Bind `spring.main.*`.
+3. Print the banner and create the context for the `WebApplicationType`.
+4. Apply `ApplicationContextInitializer`s, then `ApplicationContextInitializedEvent`. Close the bootstrap context and load sources, then `ApplicationPreparedEvent`.
+5. `refresh()`: auto-config is parsed and the web server is created in `onRefresh` and started in `finishRefresh`. Then `ContextRefreshedEvent`.
+6. `ApplicationStartedEvent` + liveness `CORRECT`.
+7. Runners.
+8. `ApplicationReadyEvent` + readiness `ACCEPTING_TRAFFIC`.
+
+On failure: `ApplicationFailedEvent` and the failure analyzers.
+</details>
+
+<details><summary>Q9. What changed with starters in Spring Boot 4?</summary>
+
+Boot 4 is modular: `spring-boot-<tech>` modules each contain their own auto-configurations and `.imports` file, so a technology's auto-config isn't even on the classpath without its starter. Several starters were renamed:
+- `spring-boot-starter-web` → `spring-boot-starter-webmvc`;
+- `spring-boot-starter-aop` → `spring-boot-starter-aspectj`;
+- the OAuth2 starters → `spring-boot-starter-security-oauth2-*`.
+
+Test support split into `spring-boot-starter-<tech>-test`. `spring-boot-starter-classic` and `spring-boot-starter-test-classic` exist to ease migration.
+</details>
+
+<details><summary>Q10. How does an executable Spring Boot jar work?</summary>
+
+The manifest's `Main-Class` is `org.springframework.boot.loader.launch.JarLauncher`, and `Start-Class` is your app. App classes are in `BOOT-INF/classes` and dependencies are stored unextracted in `BOOT-INF/lib`. The launcher creates a class loader that reads nested jars in place (`jar:nested:` URLs) in `classpath.idx` order, then invokes your `main`. `layers.idx` drives Docker layering. Boot 4 removed the classic loader and the launch script, and no longer packages optional dependencies by default.
+</details>
+
+<details><summary>Q11. When would you use an EnvironmentPostProcessor vs an ApplicationContextInitializer vs a BootstrapRegistryInitializer?</summary>
+
+- **`BootstrapRegistryInitializer`:** register objects needed *while building configuration*, such as a Vault client. It runs first.
+- **`EnvironmentPostProcessor`:** add, modify or decrypt property sources before the context exists, such as platform defaults or secrets. Register it in `spring.factories`; in Boot 4 the key is `org.springframework.boot.EnvironmentPostProcessor`.
+- **`ApplicationContextInitializer`:** customize the context after it's created and before beans are defined, such as registering singletons or setting active profiles programmatically.
+</details>
+
+<details><summary>Q12. Where and when does the embedded Tomcat start?</summary>
+
+`ServletWebServerApplicationContext.onRefresh()` creates it through the auto-configured `ServletWebServerFactory`, which registers `DispatcherServlet` and filter beans into the `ServletContext`. The connector only begins accepting requests when `WebServerStartStopLifecycle` (a `SmartLifecycle`) starts it in `finishRefresh()`, after all singletons are created. `ServletWebServerInitializedEvent` then carries the port.
+</details>
+
+<details><summary>Q13. What is a FailureAnalyzer?</summary>
+
+It's an extension that converts a startup exception into a human-readable "Description / Action" report. Boot ships many, for example for bind validation, port in use, a missing bean, or a bean override. You write one by extending `AbstractFailureAnalyzer<T extends Throwable>` and registering it in `spring.factories` under `org.springframework.boot.diagnostics.FailureAnalyzer`. `FailureAnalyzers` is the `SpringBootExceptionReporter` that runs them.
+</details>
+
+<details><summary>Q14. Why do Boot's auto-configs use proxyBeanMethods = false?</summary>
+
+Lite mode avoids CGLIB subclassing of hundreds of configuration classes, which makes startup faster and is friendlier to AOT and native images. Auto-configs never call other `@Bean` methods directly. They take dependencies as method parameters. `@AutoConfiguration` sets `proxyBeanMethods = false` for you.
+</details>
+
+
+
+## 04 — Configuration & profiles
+
+_From [notes/04-configuration/externalized-config.md](04-configuration/externalized-config.md)_
+
+
+<details><summary>Q1. What is the property-source precedence in Spring Boot?</summary>
+
+From lowest to highest:
+1. default properties;
+2. `@PropertySource`;
+3. config data (`application.yml` and profile files, with profile-specific and outside-jar files winning);
+4. `random.*`;
+5. OS env vars;
+6. Java system properties;
+7. JNDI;
+8. `ServletContext` params;
+9. `ServletConfig` params;
+10. `SPRING_APPLICATION_JSON`;
+11. command-line args;
+12. `@SpringBootTest(properties)`;
+13. `@DynamicPropertySource`;
+14. `@TestPropertySource`;
+15. devtools global settings.
+
+The rule of thumb: the closer to the launch, the higher the priority.
+</details>
+
+<details><summary>Q2. How do profile-specific files and multi-document YAML interact?</summary>
+
+`application-{profile}.yml` files load after `application.yml` and override it. With several active profiles, the last one wins. In a multi-document file, `---` (or `#---` in properties) separates documents, and `spring.config.activate.on-profile` activates a document. Later documents override earlier ones. `spring.profiles.active`/`include`/`group` can't appear in profile-specific files or activated documents.
+</details>
+
+<details><summary>Q3. @ConfigurationProperties vs @Value?</summary>
+
+`@ConfigurationProperties` binds a whole prefix into a typed object (ideally an immutable record). It supports relaxed binding, rich conversion (`Duration`, `DataSize`, collections), JSR-380 validation with `@Validated`, and IDE metadata. `@Value` injects a single key and supports SpEL, but has no validation or metadata, and is relaxed only when you write the canonical kebab-case key. Use `@ConfigurationProperties` for anything grouped or reused, and `@Value` for one-offs or SpEL.
+</details>
+
+<details><summary>Q4. Explain relaxed binding and the environment variable rules.</summary>
+
+`my.main-project.first-name`, `my.mainProject.firstName`, `my.main_project.first_name`, and `MY_MAINPROJECT_FIRSTNAME` all bind to the same property. To build the env var form, replace `.` with `_`, remove `-`, and uppercase. List indexes become `_0_` (`MY_LIST_0_NAME`). Env-var map keys are lowercased. Map keys with special characters need `[...]`. Always use the canonical kebab-case form in files, `@Value`, and placeholders.
+</details>
+
+<details><summary>Q5. What does spring.config.import do? What do optional: and configtree: mean?</summary>
+
+It pulls additional config data into the `Environment`, inserted just above the importing document, so it overrides that document. `optional:` means a missing location doesn't fail startup. `configtree:` imports a directory tree where each file path is a key and the file content is the value, as Kubernetes mounts ConfigMaps and Secrets. Other prefixes come from libraries: `configserver:`, `aws-secretsmanager:`, `vault://`, and Boot's own `env:` for a whole document in one env var.
+</details>
+
+<details><summary>Q6. How do you activate profiles, and what are profile groups?</summary>
+
+Use `spring.profiles.active` (property, env var `SPRING_PROFILES_ACTIVE`, or `--spring.profiles.active`), `SpringApplication.setAdditionalProfiles`, or `@ActiveProfiles` in tests. `spring.profiles.include` adds profiles on top. `spring.profiles.group.prod=proddb,prodmq` makes `prod` expand to its members. With no active profile, `default` is used (configurable with `spring.profiles.default`).
+</details>
+
+<details><summary>Q7. What does @Profile("prod & (eu | us)") mean?</summary>
+
+The bean or config class is registered only if `prod` is active **and** either `eu` or `us` is active. Profile expressions support `!`, `&`, and `|`, and mixing `&` and `|` requires parentheses. `@Profile({"a","b"})` means a OR b. `@Profile` is implemented as a `@Conditional` (`ProfileCondition`).
+</details>
+
+<details><summary>Q8. How do you validate configuration at startup?</summary>
+
+Annotate the `@ConfigurationProperties` type with `@Validated`, put Bean Validation constraints on the fields or record components, put `@Valid` on nested objects, and make sure a validator (`spring-boot-starter-validation`) is on the classpath. An invalid value fails startup with `BindValidationException`, and `BindValidationFailureAnalyzer` prints the property, value, origin, and reason.
+</details>
+
+<details><summary>Q9. What's the difference between ${...} and #{...}?</summary>
+
+`${key:default}` is a property placeholder resolved from the `Environment` by the placeholder configurer, or by the `Environment` itself in config files. `#{...}` is a SpEL expression evaluated when the bean is created, and it can call methods, reference beans, and use operators. They compose: placeholders resolve first, then SpEL runs (`#{'${app.owner}'.toUpperCase()}`). Since Framework 6.2, `\${...}` escapes a placeholder.
+</details>
+
+<details><summary>Q10. How do you handle secrets in Spring Boot?</summary>
+
+Keep them out of git and out of the image:
+- inject them at runtime as env vars;
+- better, as mounted files imported with `configtree:`;
+- or import them from a secrets manager (`aws-secretsmanager:`, Vault, Spring Cloud Config with `{cipher}`).
+
+Boot itself doesn't encrypt properties. Keep actuator's value masking on, don't log config objects that contain secrets, and rotate credentials with a restart or refresh strategy.
+</details>
+
+<details><summary>Q11. How does Spring Boot work with Kubernetes ConfigMaps?</summary>
+
+There are two ways:
+- **`envFrom`/`env`:** keys become env vars and bind through relaxed binding.
+- **Volume mounts:** imported with `spring.config.import=optional:configtree:/etc/config/` (or the `*/` wildcard for several mounts). Each file becomes a property.
+
+Boot reads config at startup, so changes need a rolling restart unless you add Spring Cloud Kubernetes reload. `spring.config.activate.on-cloud-platform: kubernetes` and `@ConditionalOnCloudPlatform` allow cluster-specific config.
+</details>
+
+<details><summary>Q12. What is twelve-factor config, and how does Boot support it?</summary>
+
+Factor III says config that varies between deploys belongs in the environment, strictly separated from code, so one build artifact is promoted through all environments. Boot supports it with env-var relaxed binding, the precedence order (environment overrides packaged defaults), `spring.config.import` for mounted files and secret stores, and fail-fast validation. Profiles should express capabilities, not hard-coded environment logic.
+</details>
+
+<details><summary>Q13. How are lists and maps merged across property sources?</summary>
+
+Lists are replaced wholesale: the highest-priority source that defines the list wins, and the items are never merged. Maps are merged by key, and each key takes its value from the highest-priority source defining it. This applies across all sources, not just files.
+</details>
+
+<details><summary>Q14. Why do Duration properties beat long timeoutMs properties?</summary>
+
+A `Duration` carries its unit in the value (`30s`, `5m`, `PT1H`), so the property name doesn't need a unit suffix, and no one misreads seconds as milliseconds. Boot converts it automatically. A bare number defaults to milliseconds unless `@DurationUnit` says otherwise, and IDE metadata documents the type. The same goes for `DataSize` (`10MB`) and `Period`.
+</details>
+
+
