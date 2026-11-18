@@ -2,6 +2,8 @@
 - **Phase A: Revision**
   - [00 Java 21 refresher](00-java-refresher/java21-for-spring.md)
   - [01 Spring Core: IoC & DI](01-core/spring-core.md)
+  - [02 AOP: proxies & aspects](02-aop/spring-aop.md)
+  - [03 Boot internals: auto-configuration](03-boot-internals/auto-configuration.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)

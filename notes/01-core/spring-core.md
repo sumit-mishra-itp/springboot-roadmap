@@ -492,7 +492,7 @@ Source: [Spring Framework 7.0 Release Notes](https://github.com/spring-projects/
 | `javax.annotation.*` / `javax.inject.*` support | **Removed** | `@javax.annotation.PostConstruct`, `@javax.inject.Inject` and similar are silently **ignored**. Use the `jakarta.*` versions |
 | Null-safety via **JSpecify** (`org.jspecify.annotations.Nullable`) | **New** | The framework API is annotated with JSpecify. JSR-305-based annotations are deprecated |
 | `spring-jcl` module | **Removed** | Replaced by Apache Commons Logging 1.3. This is transparent unless you excluded `spring-jcl` explicitly |
-| `@Retryable`, `@ConcurrencyLimit`, `@EnableResilientMethods`, `org.springframework.core.retry.RetryTemplate` | **New in core** | Retry without the separate Spring Retry project. Covered in note 02 (they're proxy-based) |
+| `@Retryable`, `@ConcurrencyLimit`, `@EnableResilientMethods` (`org.springframework.resilience.annotation`, spring-context) + `RetryTemplate` (`org.springframework.core.retry`) | **New** | Retry without the separate Spring Retry project. Covered in note 02 (they're proxy-based) |
 | SpEL: `Optional` unwrapping; default **10,000-operation limit** (`spring.expression.maxOperations`) | **New / Changed** | Huge SpEL expressions can now throw |
 | `ClassFileMetadataReader` on Java 24+ | **New** | Uses the JDK Class-File API instead of ASM for `@Configuration` parsing |
 | Baselines | | JDK 17+ (Boot 4 also requires 17+, and this repo uses 21), Jakarta EE 11, Kotlin 2.2 |
