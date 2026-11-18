@@ -35,7 +35,7 @@ projects/   two capstone projects (resume-grade)
 ## Phase A — Revision
 
 - [ ] 00 Java 21 refresher: records, sealed types, pattern matching, streams, Optional, virtual threads
-- [ ] 01 Spring Core: IoC, DI, bean scopes and lifecycle, `@Configuration`, BeanPostProcessor, events (lab `01-core-ioc`)
+- [x] 01 Spring Core: IoC, DI, bean scopes and lifecycle, `@Configuration`, BeanPostProcessor, events (lab `01-core-ioc`)
 - [ ] 02 AOP: JDK vs CGLIB proxies, advice, pointcuts, self-invocation (lab `02-aop-logging`)
 - [ ] 03 Boot internals: starters, auto-configuration, `@Conditional*`, modular starters in Boot 4 (lab `03-custom-starter`)
 - [ ] 04 Configuration: YAML, profiles, `@ConfigurationProperties`, property precedence
