@@ -1860,3 +1860,87 @@ Check `/actuator/startup` with `BufferingApplicationStartup` to find slow beans.
 </details>
 
 
+
+## 16 AWS with Spring Cloud AWS
+
+_From [notes/16-aws/aws-spring.md](16-aws/aws-spring.md)_
+
+
+<details><summary>Q1. What does Spring Cloud AWS add on top of the AWS SDK v2?</summary>
+
+Auto-configured SDK clients that share one credentials provider, one region provider and endpoint overrides. Spring-style templates: `S3Template` (with presigned URLs and JSON store/read), `SqsTemplate` and `SnsTemplate`. A full SQS listener container behind `@SqsListener`, with back pressure, batching, acknowledgement modes, visibility control and FIFO support. Secrets Manager and Parameter Store as Boot config data through `spring.config.import`, with optional reload. Testcontainers `@ServiceConnection` and Docker Compose support for LocalStack and Floci. It's opinionated wiring, and you can always drop down to the raw client beans.
+</details>
+
+<details><summary>Q2. How does an app running on ECS or EKS get AWS credentials, and why not access keys?</summary>
+
+Through the SDK's default credentials chain, which finds container credentials: the ECS task role through `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, EKS Pod Identity through `AWS_CONTAINER_CREDENTIALS_FULL_URI`, or IRSA through a web identity token. STS issues temporary credentials that the SDK refreshes automatically. Long-lived access keys never expire on their own, leak through config, logs and CI, and must be rotated by hand. Roles leave nothing to leak, and they scope permissions per workload. Keys are acceptable only against emulators with dummy values.
+</details>
+
+<details><summary>Q3. Explain SQS visibility timeout, maxReceiveCount and DLQ redrive.</summary>
+
+A receive hides the message for the visibility timeout (default 30 s). If the consumer deletes it in time, it's done. If not, it becomes visible again and its receive count goes up. When the receive count exceeds the source queue's `RedrivePolicy.maxReceiveCount`, SQS moves the message to the dead-letter queue. The app doesn't do it. After fixing the bug, you redrive the DLQ back to the source. The lab shows a poison message invoked exactly `maxReceiveCount` (2) times, then found in the DLQ.
+</details>
+
+<details><summary>Q4. What happens when an @SqsListener method throws, and how do acknowledgement modes change that?</summary>
+
+With the default `ON_SUCCESS`, the message isn't acknowledged (not deleted). It reappears after the visibility timeout, and the redrive policy eventually DLQs it. `ALWAYS` deletes it even on failure, so failures are dropped unless you handle them yourself. `MANUAL` injects an `Acknowledgement`, and nothing is deleted until you call `acknowledge()`. An `ErrorHandler` that completes normally marks the message as recovered, so it gets acknowledged. Rethrow from the handler to keep SQS retries.
+</details>
+
+<details><summary>Q5. Standard vs FIFO queues: when do you choose FIFO and what does it cost?</summary>
+
+Standard queues have nearly unlimited throughput, at-least-once delivery, and best-effort order. FIFO queues give strict order within a `MessageGroupId` and 5-minute deduplication by `MessageDeduplicationId` or content hash. They have lower throughput (300 calls/s per action, more with batching or high-throughput mode), and a failed message blocks its group. Choose FIFO for per-entity ordering such as a ledger or an order state machine, and use the entity id as the group id. Consumers still need idempotence beyond the 5-minute window.
+</details>
+
+<details><summary>Q6. Why put SQS queues behind an SNS topic instead of having the producer send to each queue?</summary>
+
+Fan-out decouples the producer from the consumers. The producer publishes once and doesn't know who listens. Each consumer owns its queue, which buffers its outages, holds its own DLQ and alarms, and can filter with a subscription filter policy. Adding a consumer is one subscription with no producer change. Sending to N queues yourself couples the producer to every consumer and makes partial failures (sent to 2 of 3) your problem.
+</details>
+
+<details><summary>Q7. What's the difference between raw message delivery and the default SNS envelope, and how does Spring handle each?</summary>
+
+By default SQS receives a JSON envelope (`Type`, `MessageId`, `TopicArn`, `Subject`, `Message` as a string, signature fields). Annotate the listener parameter with `@SnsNotificationMessage` to unwrap and convert `Message`. Use `@SnsNotificationSubject` or `SnsNotification<T>` for the metadata. With `RawMessageDelivery=true`, the SQS body is the original payload and SNS attributes become SQS attributes, so the listener takes the plain type.
+</details>
+
+<details><summary>Q8. How do presigned URLs work, and what are their security properties?</summary>
+
+The server computes a SigV4 signature locally with its own (role) credentials, over the method, bucket, key, expiry and signed headers, and puts it in the query string. Anyone holding the URL can perform that one operation until it expires, with no AWS credentials, and only if the signer's role is allowed to. Expiry is capped at 7 days and by the signer's session lifetime. Signed headers such as `Content-Type` must match exactly, otherwise `403 SignatureDoesNotMatch`. A PUT URL can't limit object size, so use a POST policy or validate after upload. Keep TTLs short and generate keys server-side.
+</details>
+
+<details><summary>Q9. How does spring.config.import=aws-secretsmanager work, and why can't @ServiceConnection configure it?</summary>
+
+It's a Boot ConfigData location. While `SpringApplication` prepares the `Environment`, `SecretsManagerConfigDataLocationResolver` builds a bootstrap `SecretsManagerClient` from `spring.cloud.aws.*` properties, and `SecretsManagerConfigDataLoader` calls `GetSecretValue`. A JSON secret's keys become properties (optionally prefixed). This all happens before the `ApplicationContext` exists, so beans, including `@ServiceConnection` containers and `AwsConnectionDetails`, aren't there yet. In tests you must set the endpoint (and dummy credentials and region) as system properties or command-line args before startup. Customizing the bootstrap client goes through a `BootstrapRegistryInitializer`.
+</details>
+
+<details><summary>Q10. Secrets Manager vs Parameter Store?</summary>
+
+Secrets Manager stores JSON secrets, always KMS-encrypted, with built-in rotation (managed rotation for RDS, or rotation Lambdas), cross-region replication and resource policies. It's billed per secret per month plus per API call. Parameter Store holds hierarchical key-values (plain or `SecureString`). Standard parameters are free, and it has no built-in rotation. Use Secrets Manager for rotating credentials, and Parameter Store for configuration and feature flags. SCA imports both with the same `spring.config.import` mechanism.
+</details>
+
+<details><summary>Q11. A DB password rotates in Secrets Manager. How does a running Spring app keep connecting?</summary>
+
+Existing pooled connections survive rotation. New connections need the new password. The options are:
+- **Alternating-users rotation:** previous credentials stay valid for a full period, so read-at-startup plus regular restarts is enough.
+- **A secret-aware JDBC wrapper** (AWS Secrets Manager JDBC driver or AWS Advanced JDBC Wrapper): it re-fetches the secret on an auth failure and retries.
+- **IAM DB authentication:** a per-connection token, so nothing to rotate.
+
+SCA's reload (`refresh`) re-binds setter-style properties beans and `@RefreshScope` beans (not records), but doesn't rebuild an existing `HikariDataSource`, so on its own it isn't enough for DB passwords. `restart_context` works, but restarts the context.
+</details>
+
+<details><summary>Q12. How do you test Spring Cloud AWS code without an AWS account?</summary>
+
+Run an emulator in Testcontainers (LocalStack, or Floci since LocalStack's 2026 auth-token change) and annotate the container bean with `@ServiceConnection` (artifact `spring-cloud-aws-testcontainers`). Provision queues, topics, buckets and secrets *before* the context starts, and expose the endpoint as properties for config import. Use dummy `test`/`test` credentials. Assert asynchronous effects with Awaitility or Mockito `verify(timeout(...))`. Share one test context so listener containers don't compete. Remember that emulators don't enforce IAM, or (by default) S3 signature validation.
+</details>
+
+<details><summary>Q13. How would you route reads to an RDS/Aurora read replica in Spring, and what's the catch?</summary>
+
+Use two pools (writer, reader) behind `LazyConnectionDataSourceProxy` with a read-only data source (Framework 6.1.2+), or an `AbstractRoutingDataSource` keyed on `TransactionSynchronizationManager.isCurrentTransactionReadOnly()`. Then `@Transactional(readOnly = true)` methods hit the reader. The lazy proxy matters because the connection must be chosen after the transaction's read-only flag is set. The catch is replication lag: read-your-writes can fail. Keep post-write reads on the writer, and remember that the reader endpoint balances per connection, not per query.
+</details>
+
+<details><summary>Q14. Name three AWS cost traps for a typical Spring Boot service.</summary>
+
+- **NAT Gateway data processing** for S3 and AWS API traffic from private subnets. Fix it with an S3 gateway endpoint (free) and interface endpoints.
+- **Short polling or tiny batches on SQS.** Every receive, even an empty one, is billed. Fix it with long polling (10–20 s), receive batches of 10, and batched deletes (SCA's defaults).
+- **Chatty Secrets Manager or KMS calls and CloudWatch Logs ingestion.** Fix them by caching secrets (read at startup), using S3 Bucket Keys, keeping log levels and retention sane, and adding lifecycle rules that abort incomplete multipart uploads.
+</details>
+
+
