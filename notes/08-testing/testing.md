@@ -1107,6 +1107,8 @@ No lab configures JaCoCo yet, so these plugin details come from general practice
 
 ### 5.7 Contract testing (concept)
 
+> **Boot 4 status:** Spring Cloud Contract is **not part of the Spring Cloud 2025.1 release train**. Its last release is 5.0.3. Spring Initializr now offers **Stubborn Contract** (`sh.stubborn`), which its docs call the official continuation of Spring Cloud Contract 5.x. The concepts below are the same in both, but check the artifact names before you add the dependency (verified 2026-11-19; see note 14).
+
 | | Spring Cloud Contract | Pact |
 |---|---|---|
 | Who writes the contract | The **producer** (Groovy/YAML/Kotlin DSL in the producer repo), driven by consumer pull requests | The **consumer**: its tests record interactions into a pact file |

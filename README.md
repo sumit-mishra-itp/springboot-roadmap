@@ -51,7 +51,7 @@ projects/   two capstone projects (resume-grade)
 - [x] 11 Messaging with Kafka: retries, DLT, idempotency, outbox (lab `11-kafka`)
 - [x] 12 Async, scheduling, Spring Batch, virtual threads (lab `12-batch-csv-import`)
 - [x] 13 Reactive: WebFlux, Reactor, R2DBC (lab `13-webflux`)
-- [ ] 14 Microservices / Spring Cloud: Gateway, Config, Resilience4j, `@HttpExchange`, tracing
+- [x] 14 Microservices / Spring Cloud: Gateway, Config, Resilience4j, `@HttpExchange`, tracing
 - [ ] 15 Packaging and deploy: Docker, buildpacks, native image, GitHub Actions, Kubernetes
 
 ## Phase C — AWS

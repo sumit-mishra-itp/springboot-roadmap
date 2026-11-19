@@ -1600,3 +1600,179 @@ Spring Kafka 4.x is built on the Apache Kafka 4 clients (Boot 4.1.2 ships Spring
 </details>
 
 
+
+## 14 Microservices & Spring Cloud
+
+_From [notes/14-microservices/spring-cloud.md](14-microservices/spring-cloud.md)_
+
+
+<details><summary>Q1. When would you choose microservices over a modular monolith, and what does the choice cost?</summary>
+
+Choose microservices when you have **independent teams that need independent deploys**, parts with **very different scaling or availability needs**, or **isolation requirements** (PCI scope, fault isolation). The cost is the distributed systems tax:
+- network failures and latency on every call (the eight fallacies);
+- no ACID across services (sagas, outbox, eventual consistency);
+- API versioning;
+- per-service CI/CD, tracing, config and on-call.
+
+For one team or an unclear domain, a modular monolith (Spring Modulith) gives enforced boundaries and in-process events at a fraction of the cost. It also keeps the option to extract later. Split along DDD bounded contexts, with a database per service. If two services always deploy together, you built a distributed monolith.
+</details>
+
+<details><summary>Q2. Explain the circuit breaker states and the settings that drive the transitions.</summary>
+
+- **CLOSED:** calls pass, and their outcomes are recorded in a sliding window (count-based or time-based).
+- **CLOSED to OPEN:** once at least `minimumNumberOfCalls` calls are recorded, the breaker opens when the failure rate reaches `failureRateThreshold` or the slow-call rate reaches `slowCallRateThreshold` (calls slower than `slowCallDurationThreshold`).
+- **OPEN:** calls fail fast with `CallNotPermittedException` and go to the fallback.
+- **OPEN to HALF_OPEN:** after `waitDurationInOpenState`.
+- **HALF_OPEN:** allows `permittedNumberOfCallsInHalfOpenState` trial calls. It closes if they are healthy and opens again if not.
+- **Manual states:** DISABLED, FORCED_OPEN and METRICS_ONLY.
+
+The Resilience4j defaults are 100 calls in the window, 100 minimum calls, a 50% failure rate, 60 s open, and 10 half-open calls. The minimum of 100 is why breakers "never trip" in tests.
+</details>
+
+<details><summary>Q3. In which order do Retry, CircuitBreaker, RateLimiter, TimeLimiter and Bulkhead apply, and why does it matter?</summary>
+
+With Resilience4j's Spring annotations, the default is `Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead(call)))))`:
+- **Retry is outermost**, so each attempt passes through the breaker and is counted. Once the breaker opens, the retries see `CallNotPermittedException`. Configure Retry to ignore it, or it wastes attempts.
+- **The bulkhead is innermost**, so rejections count as breaker failures.
+
+If you put the breaker *outside* the retry, it would count one failure per *logical* call instead of per attempt. Change the order with the `*AspectOrder` properties or the `Decorators` builder. Spring Cloud CircuitBreaker's factory itself composes CircuitBreaker + TimeLimiter (+ Bulkhead if present).
+</details>
+
+<details><summary>Q4. Spring Cloud Gateway: what are routes, predicates and filters, and how do you choose between the WebFlux and Web MVC servers?</summary>
+
+- A **route** is an id, a destination URI, predicates and filters.
+- **Predicates** (Path, Method, Host, Header, Weight and so on) decide whether the route matches. The first matching route wins.
+- **Filters** modify the request or response: StripPrefix, headers, CircuitBreaker, Retry, TokenRelay, rate limiting.
+
+**WebFlux** (`spring-cloud-starter-gateway-server-webflux`, `spring.cloud.gateway.server.webflux.*`) runs on Netty and is non-blocking. It suits very high concurrency, streaming and WebSockets, and it has the Redis rate limiter.
+
+**Web MVC** (`...-server-webmvc`, `...server.webmvc.*`) is functional routing on the Servlet stack. It is simpler to debug, scales well with virtual threads, and uses Bucket4j for rate limiting.
+
+Both were renamed in 2025.0, and the old starters don't exist for Boot 4. Initializr's `cloud-gateway` id is now the Web MVC variant.
+</details>
+
+<details><summary>Q5. How does gateway rate limiting work, and how do you make it work across several gateway replicas?</summary>
+
+It uses the token bucket algorithm. Each key (user, API key, or IP) has a bucket with capacity B that refills at R tokens per second. A request consumes tokens, and an empty bucket means 429.
+
+To share limits across replicas, the bucket state must be central:
+- **WebFlux:** the `RequestRateLimiter` filter with `RedisRateLimiter` (`replenishRate`, `burstCapacity`, `requestedTokens`). It runs an atomic Lua script in Redis and needs `spring-boot-starter-data-redis-reactive`. The default key resolver is the principal name, and a missing key is denied.
+- **Web MVC:** Bucket4j with a distributed `ProxyManager` backend. The key resolver is Java-DSL only, and a missing key returns 403.
+</details>
+
+<details><summary>Q6. Eureka vs Kubernetes Services: why do most K8s shops skip Eureka?</summary>
+
+Kubernetes already provides discovery:
+- A Service gets a stable DNS name and a virtual IP.
+- Its endpoints are maintained from **readiness probes**.
+- kube-proxy (or a mesh) balances traffic.
+
+Eureka would add a stateful server to operate and a 30–90 s staleness window from heartbeats and caches, and it only helps JVM clients. On K8s you call `http://payment-service` and need neither Eureka nor client-side load balancing. With HTTP service groups, a plain `http://` base URL disables LoadBalancer interception.
+
+Eureka still fits VM or ECS fleets, and hybrid setups where some services live outside the cluster.
+</details>
+
+<details><summary>Q7. How does `@RefreshScope` work, and when don't you need it?</summary>
+
+A refresh (`/actuator/refresh`, or `/actuator/busrefresh` through Spring Cloud Bus) makes `ContextRefresher` rebuild the Environment and publish an `EnvironmentChangeEvent` with the changed keys:
+- `ConfigurationPropertiesRebinder` then re-binds `@ConfigurationProperties` beans in place. That works for JavaBean-style classes with setters, but **not for records**. A test showed that a record keeps its old value, because constructor binding is immutable.
+- `@RefreshScope` beans are lazy scoped proxies. Refreshing clears the scope's cache, so the next call builds a new instance with the new `@Value`s and constructor-time state.
+
+A plain `@Value` on a singleton also keeps the old value. You need `@RefreshScope` for beans that take `@Value`s or bake config into their state at construction. The same test showed that a `@RefreshScope` bean's `@Value` does update.
+
+On Kubernetes, many teams skip hot refresh entirely and roll pods on a ConfigMap change, for reproducibility.
+</details>
+
+<details><summary>Q8. `@HttpExchange` vs OpenFeign: what would you use on Boot 4, and how do you add load balancing and fallbacks?</summary>
+
+Use `@HttpExchange`. OpenFeign has been feature-complete since 2022.0, and its docs recommend migrating to Spring HTTP Service Clients. `@HttpExchange` interfaces are backed by `RestClient` or `WebClient`, so you get their observability, SSL bundles, interceptors and Boot properties. They also support reactive types.
+
+Framework 7's `@ImportHttpServices` registers the clients in **groups**, and Boot 4 configures each group with `spring.http.serviceclient.<group>.base-url`, timeouts and so on. Spring Cloud 2025.1 adds:
+- **Load balancing:** the group's base URL is unset (it becomes `http://<group>`) or uses `lb://`.
+- **Circuit breaking:** `@HttpServiceFallback(value = Fallback.class, group = "...")`. The fallback methods match by name and parameters, optionally with a leading `Throwable`.
+</details>
+
+<details><summary>Q9. How do you keep data consistent across services without distributed transactions?</summary>
+
+Use a **saga**, a series of local transactions with compensating actions:
+- **Choreography:** services react to each other's events.
+- **Orchestration:** a central coordinator sends commands.
+
+Make it reliable with three things:
+1. **A transactional outbox.** The business row and the event row commit in one local transaction, and a relay or CDC publishes the events. That gives at-least-once delivery without dual-write races.
+2. **Idempotent consumers.** A processed-message-id table is updated in the same transaction as the side effect. HTTP uses `Idempotency-Key`.
+3. **A UX that accepts eventual consistency.** The order stays `PENDING` until the saga completes.
+
+2PC/XA is avoided because it locks across the network, needs every participant to support it, and makes the coordinator a single point of failure.
+</details>
+
+<details><summary>Q10. API composition or CQRS for a page that needs data from four services?</summary>
+
+**API composition** (a BFF calls the four services in parallel and merges the results) is simple and real-time. But its availability is the product of all four, so it needs fallbacks per call, and its latency is the slowest call.
+
+**CQRS** builds a denormalized read model from the services' events in its own store. It is fast and stays available, but it is eventually consistent and needs replay and rebuild tooling.
+
+Use composition for detail pages that must be fresh. Use CQRS for lists, search, dashboards and cross-service filtering or sorting, which composition can't do efficiently, for example "orders over $100 whose shipment is late".
+</details>
+
+<details><summary>Q11. How do you secure service-to-service calls?</summary>
+
+There are two identities.
+
+**The user's identity** travels as the user's JWT:
+- The gateway validates it, or converts a session to a token with `TokenRelay`.
+- Each service **re-validates** the JWT as a resource server (zero trust).
+- Token exchange can narrow the token's audience.
+
+**The service's own identity** is used when there is no user, such as a job or a consumer:
+- It uses an OAuth2 `client_credentials` token, attached by `OAuth2ClientHttpRequestInterceptor` on `RestClient`.
+- The downstream authorizes it by scope.
+
+Add mTLS (a mesh or SSL bundles) for workload identity and encryption in transit. Never log or propagate tokens in baggage.
+</details>
+
+<details><summary>Q12. How do you test that a change in `payment-service` won't break `order-service`?</summary>
+
+Use consumer-driven contract tests:
+1. The order team writes contracts (or Pact files) describing the requests it makes and the responses it relies on.
+2. The payment build verifies them against its real controllers and publishes stubs.
+3. The order build tests its `@HttpExchange` client against those stubs.
+
+A breaking change fails the producer's build before deploy.
+
+Note the 2025.1 change: **Spring Cloud Contract is no longer in the release-train BOM**. Initializr offers Stubborn Contract, its official continuation, which reads existing contracts unchanged. Pact is the polyglot alternative.
+
+Complement contracts with WireMock fault-injection tests for resilience, Testcontainers integration tests per service, and only a few end-to-end journeys.
+</details>
+
+<details><summary>Q13. What is the strangler fig pattern, and what is the most common mistake?</summary>
+
+It is an incremental migration:
+1. Put a gateway in front of the monolith.
+2. Build one bounded context as a new service with its own database, synced through CDC or an outbox plus an anti-corruption layer.
+3. Shift that context's routes gradually, using canary weights.
+4. Delete the old code, and repeat.
+
+**The most common mistake** is letting the new service read or write the legacy database directly to save time. That keeps the coupling, and the "migration" never finishes. The second most common is extracting a context with unclear seams first. Pick a well-bounded, valuable one.
+</details>
+
+<details><summary>Q14. Framework 7 ships `@Retryable`. Does that replace Resilience4j?</summary>
+
+No. Framework 7's `@Retryable` and `@ConcurrencyLimit` (in `org.springframework.resilience.annotation`, activated by `@EnableResilientMethods`, which Boot doesn't auto-enable) cover retries and concurrency throttling without extra dependencies.
+
+They have **no circuit breaker, rate limiter or time limiter, and no Micrometer metrics**. For calls across a network in production, use Resilience4j (directly, or via Spring Cloud CircuitBreaker, which the Gateway filter and `@HttpServiceFallback` use). Use the core annotations for simple in-service retries, such as an optimistic-lock retry or a flaky local resource.
+</details>
+
+<details><summary>Q15. A checkout page goes down whenever the recommendation service is slow. Walk through the fix.</summary>
+
+This is a cascading failure. Slow calls hold request threads until the pool is exhausted. The fix:
+1. **A timeout** on the optional call (TimeLimiter or a read timeout, e.g. 300 ms).
+2. **A bulkhead** capping concurrent recommendation calls (a semaphore with virtual threads), so it can't consume checkout's capacity.
+3. **A circuit breaker** that opens on the slow-call or failure rate, so calls stop entirely during the incident.
+4. **A fallback**: an empty list or cached top sellers.
+5. **Alerts** on breaker state, so the degradation is visible.
+
+Critical dependencies (pricing) get timeouts and idempotent retries, but no silent fallback. Also check that nothing retries at several layers.
+</details>
+
+
