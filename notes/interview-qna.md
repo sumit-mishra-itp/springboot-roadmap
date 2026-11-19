@@ -1518,3 +1518,85 @@ Use `StepVerifier` from reactor-test: `expectNext`, `expectError`, `verifyComple
 </details>
 
 
+
+## 11 Messaging with Kafka
+
+_From [notes/11-messaging-kafka/kafka.md](11-messaging-kafka/kafka.md)_
+
+
+<details><summary>Q1. How does Kafka differ from a traditional message queue like RabbitMQ?</summary>
+
+Kafka is a **distributed, partitioned, replicated log**. Records are appended and kept for a retention period (or compacted by key), whatever has been read. Consumers *pull* and track their own **offsets**, so any number of consumer groups read the same data independently and can **replay** it. RabbitMQ is a **smart broker**: exchanges route messages to queues, the broker pushes them to consumers, and it deletes a message once it is acked. Rabbit offers per-message features (priorities, TTL, delayed delivery, rich routing). Kafka offers throughput, retention, replay, and per-partition ordering at scale. Choose Kafka for event streaming, CDC, and fan-out to many consumers. Choose RabbitMQ (or SQS) for task queues and complex routing.
+</details>
+
+<details><summary>Q2. What is a partition, and how does Kafka decide which partition a record goes to?</summary>
+
+A partition is an ordered, append-only log, and the unit of parallelism, ordering, and replication. With a key, the default partitioner computes `toPositive(murmur2(keyBytes)) % numPartitions`, so the same key always goes to the same partition while the partition count is unchanged. The lab test recomputes this and matches the broker's answer. With a null key, Kafka 3.3+ uses a sticky partitioner: it fills a batch for one partition, then switches. Adding partitions changes the modulus and remaps keys, which breaks per-key ordering across the change.
+</details>
+
+<details><summary>Q3. Explain the ISR, the high watermark and `min.insync.replicas`.</summary>
+
+Each partition has a leader and followers. The **ISR** is the set of replicas caught up with the leader (within `replica.lag.time.max.ms`). The **high watermark** is the highest offset replicated to all ISR members, and consumers can only read up to it. With `acks=all`, the leader acknowledges a write only once the whole ISR has it, **and** the ISR has at least `min.insync.replicas` members. Otherwise the producer gets `NotEnoughReplicasException`. RF=3 with `min.insync.replicas=2` survives one broker failure with no data loss and no write outage. Leaders are only elected from the ISR unless `unclean.leader.election.enable=true`, which trades durability for availability.
+</details>
+
+<details><summary>Q4. What does `enable.idempotence` do, and what does it not do?</summary>
+
+The broker assigns the producer a **PID** and an epoch, and every batch carries a per-partition **sequence number**. If a retry resends a batch whose ack was lost, the leader sees the duplicate sequence and drops it. A gap is rejected, which keeps ordering intact even with up to 5 in-flight requests. It has been on by default since Kafka 3.0, together with `acks=all`. It does **not** dedupe across producer restarts (a new PID), across two calls to `send()` by your code, or anything on the consumer side. End-to-end deduplication still needs transactions (Kafka to Kafka) or idempotent consumers.
+</details>
+
+<details><summary>Q5. At-most-once, at-least-once, exactly-once: how do you get each, and what does Kafka's EOS really cover?</summary>
+
+**At-most-once**: commit the offset before processing, so a crash loses the record. **At-least-once**: process, then commit, so a crash reprocesses it. This is Spring's default (offsets are committed after the listener returns, per the `AckMode`). **Exactly-once (EOS)**: a transactional producer writes its outputs and `sendOffsetsToTransaction` in one Kafka transaction, and downstream readers use `read_committed`. EOS covers **only the Kafka-to-Kafka loop**. A database write, an HTTP call, or an email inside the listener is not rolled back when the Kafka transaction aborts. For external side effects you use at-least-once plus **idempotent consumers** (a processed-id table in the same DB transaction, or upserts), which gives "effectively once".
+</details>
+
+<details><summary>Q6. What is the transactional outbox pattern, and why not just call `kafkaTemplate.send()` after saving?</summary>
+
+Saving and sending is a **dual write** across two systems with no shared transaction. A crash after the commit loses the event, and a send before a failed commit publishes a phantom event. The outbox writes the event into an `outbox` table **in the same local DB transaction** as the business change, so both commit or neither does. A relay (a `@Scheduled` poller with `FOR UPDATE SKIP LOCKED`, or Debezium CDC reading the WAL) publishes the rows to Kafka and marks them sent. Delivery is at-least-once, so consumers must be idempotent. The lab proves that a rollback leaves neither row, and that the relay plus the consumer reserve stock end to end.
+</details>
+
+<details><summary>Q7. How do you make a Kafka consumer idempotent?</summary>
+
+Give every event a unique id (`eventId`). In the **same database transaction** as the side effect, insert that id into a `processed_message` table with a primary key. If the insert affects 0 rows (`INSERT ... ON CONFLICT DO NOTHING` in Postgres), it is a duplicate, so skip it. If the side effect fails, the transaction rolls back the marker too, and the redelivery is processed again. Don't catch a duplicate-key exception inside the transaction, because Postgres aborts the whole transaction after a failed statement. Alternatives are natural idempotency (upsert by business key, or `UPDATE ... WHERE version = n`) or storing consumer offsets in the same DB.
+</details>
+
+<details><summary>Q8. What happens during a consumer group rebalance, and how do you minimize its impact?</summary>
+
+When members join or leave, or partitions change, the group reassigns partitions. With the classic **eager** protocol, every member revokes all its partitions and processing stops group-wide until the new assignment. **Cooperative sticky** revokes only the partitions that move, over two rounds. **KIP-848** (`group.protocol=consumer`, GA in Kafka 4.0, opt-in) moves assignment to the broker and makes it fully incremental. Other ways to reduce impact: **static membership** (`group.instance.id`) so restarts within `session.timeout.ms` don't rebalance, keeping processing well within `max.poll.interval.ms`, and committing offsets in `onPartitionsRevoked`. Spring's container already commits pending offsets on revocation (unverified).
+</details>
+
+<details><summary>Q9. `session.timeout.ms` vs `max.poll.interval.ms`: what is the difference?</summary>
+
+`session.timeout.ms` (45 s) is liveness. A background heartbeat thread proves the **process** is alive. `max.poll.interval.ms` (5 min) is progress. If your code does not call `poll()` again within it, because processing one batch of up to `max.poll.records` (500) took too long, the consumer proactively leaves the group even though it is alive. Its partitions go to someone else, its commit fails with `CommitFailedException`, and the records are processed twice. Fix it by processing faster, lowering `max.poll.records`, or raising the interval. Also keep `DefaultErrorHandler` back-offs short, because they block the poll loop.
+</details>
+
+<details><summary>Q10. `DefaultErrorHandler` vs `@RetryableTopic`: when do you use which?</summary>
+
+`DefaultErrorHandler` retries **in place (blocking)**. It re-seeks the failed record, sleeps per the `BackOff`, and after the retries calls a recoverer such as `DeadLetterPublishingRecoverer`, which publishes to `<topic>-dlt` on the same partition. Not-retryable exceptions (deserialization errors, your business rejections) go straight to the recoverer. It **preserves per-key order**, but it blocks the partition, so back-offs must be short. `@RetryableTopic` retries **non-blocking**: the failed record is re-published to retry topics with growing delays while the main partition keeps flowing, and ends in a `-dlt` topic handled by a `@DltHandler`. It suits independent events with slow dependencies, but **breaks ordering**. The lab uses `DefaultErrorHandler`, because order events must stay ordered.
+</details>
+
+<details><summary>Q11. What does `ConcurrentKafkaListenerContainerFactory` create, and what does `concurrency` actually mean?</summary>
+
+For each `@KafkaListener`, the factory creates a `ConcurrentMessageListenerContainer`. That container creates `concurrency` child `KafkaMessageListenerContainer`s. Each child owns one `KafkaConsumer` and one thread, which polls and invokes your listener. All children are in the same group, so Kafka splits the partitions between them. Concurrency is capped by the partition count: with 3 partitions and concurrency 5, two children are idle. The lab test shows 3 children with exactly 1 partition each. Containers are registered in `KafkaListenerEndpointRegistry` (a `SmartLifecycle`), which starts them late in the context refresh and lets you pause, resume, or stop them by id.
+</details>
+
+<details><summary>Q12. How does Kafka guarantee ordering, and how can you accidentally lose it?</summary>
+
+Ordering is guaranteed **only within a partition**. Use the entity id as the key, so all of its events go to one partition and are consumed by one thread. You lose ordering by: using no key or a random key, adding partitions (keys remap), disabling idempotence with retries and more than one in-flight request, using `@RetryableTopic` (a retried record is overtaken), handing records to a thread pool inside the listener, or redriving old DLT records after newer events were processed. Consumers that must be robust anyway should check an aggregate version and drop stale events.
+</details>
+
+<details><summary>Q13. What is log compaction, and when would you use a compacted topic?</summary>
+
+With `cleanup.policy=compact`, Kafka keeps at least the **latest value per key** and a background cleaner removes older ones. A null value is a **tombstone** that deletes the key after `delete.retention.ms`. Offsets are preserved (with gaps). Use it for "current state" topics: entity snapshots, configuration, a KTable changelog, `__consumer_offsets` itself, or a lookup table that new services bootstrap from by reading from the beginning. Pair it with an infinite-retention event topic when you need the full history (event sourcing or audit).
+</details>
+
+<details><summary>Q14. How do you evolve event schemas without breaking consumers?</summary>
+
+Use a schema format with evolution rules (Avro or Protobuf) and a **Schema Registry**. The producer registers the schema and sends a schema id with each record. The consumer fetches the writer's schema and resolves it against its own. The registry enforces a **compatibility mode** per subject. `BACKWARD` (the default) means new readers can read old data: delete fields or add fields with defaults, and upgrade consumers first. `FORWARD` means old readers can read new data: add fields, and upgrade producers first. `FULL` means both. `*_TRANSITIVE` checks all past versions. With JSON (like the lab), you rely on discipline: only add optional fields, never rename or change types, use tolerant readers (ignore unknown properties), and run contract tests.
+</details>
+
+<details><summary>Q15. What changed for Kafka in Spring Boot 4 / Spring Kafka 4?</summary>
+
+Spring Kafka 4.x is built on the Apache Kafka 4 clients (Boot 4.1.2 ships Spring Kafka 4.1.2 and kafka-clients 4.2.2). **ZooKeeper support is removed** (`EmbeddedKafkaZKBroker` is gone, KRaft only). **Jackson 3** classes replace the Jackson 2 ones, which are deprecated: `JacksonJsonSerializer`/`Deserializer`, `JacksonJsonMessageConverter`, and `JsonKafkaHeaderMapper`. **Spring Retry was replaced by Framework 7's core retry**, so `@RetryableTopic` uses `@BackOff` instead of `@Backoff`, and Boot's `spring.kafka.retry.topic.backoff.random` became `...jitter`. The **KIP-848** rebalance protocol and **share consumers** (Kafka Queues) are supported. 4.1 adds a per-listener `ackMode`. Boot moved Kafka into the `spring-boot-kafka` module with `spring-boot-starter-kafka` and `-kafka-test`. Testcontainers 2 uses `testcontainers-kafka` with `org.testcontainers.kafka.KafkaContainer` (for example on `apache/kafka-native`) and `@ServiceConnection`.
+</details>
+
+
