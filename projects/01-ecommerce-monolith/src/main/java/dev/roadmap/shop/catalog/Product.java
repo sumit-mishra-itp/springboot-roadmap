@@ -71,6 +71,17 @@ public class Product {
         this.category = category;
     }
 
+    /**
+     * Only checks against the stock THIS transaction read. Two buyers can both pass this check for the last unit;
+     * the @Version column then lets only the first UPDATE commit, and the other gets a 409 concurrent-update.
+     */
+    public void decrementStock(int quantity) {
+        if (quantity > stock) {
+            throw new InsufficientStockException(id, quantity, stock);
+        }
+        stock -= quantity;
+    }
+
     public Long getId() {
         return id;
     }

@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import java.math.BigDecimal;
@@ -16,6 +17,7 @@ import org.mockito.ArgumentCaptor;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -25,15 +27,23 @@ import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.security.test.context.support.WithAnonymousUser;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
 
+import dev.roadmap.shop.auth.SecurityConfig;
 import dev.roadmap.shop.common.ApiExceptionHandler;
 import dev.roadmap.shop.common.NotFoundException;
 
-/** Web slice: controller + advice + Spring Data web support (Pageable binding). The service is a mock. */
+/**
+ * Web slice: controller + advice + Spring Data web support (Pageable binding) + the REAL SecurityConfig. The service is
+ * a mock. Requests run as ADMIN unless a test says otherwise, and the last tests pin down the catalog URL rules.
+ */
 @WebMvcTest(ProductController.class)
+@Import(SecurityConfig.class)
+@WithMockUser(roles = "ADMIN")
 class ProductControllerTest {
 
     static final String KEYBOARD_JSON = """
@@ -136,6 +146,38 @@ class ProductControllerTest {
         ArgumentCaptor<Pageable> pageable = ArgumentCaptor.forClass(Pageable.class);
         verify(service).list(isNull(), pageable.capture());
         assertThat(pageable.getValue()).isEqualTo(PageRequest.of(0, 20, Sort.by("id")));
+    }
+
+    @Test
+    @WithAnonymousUser
+    void list_anonymous_isPublic() {
+        given(service.list(any(), any())).willReturn(Page.empty());
+
+        assertThat(mvc.get().uri("/api/products")).hasStatusOk();
+    }
+
+    @Test
+    @WithAnonymousUser
+    void create_anonymous_returns401Problem() {
+        assertThat(post(KEYBOARD_JSON))
+                .hasStatus(HttpStatus.UNAUTHORIZED)
+                .hasContentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .bodyJson().extractingPath("$.type").isEqualTo(ApiExceptionHandler.PROBLEM_BASE + "unauthorized");
+    }
+
+    @Test
+    @WithMockUser(roles = "CUSTOMER")
+    void create_asCustomer_returns403Problem() {
+        assertThat(post(KEYBOARD_JSON))
+                .hasStatus(HttpStatus.FORBIDDEN)
+                .bodyJson().extractingPath("$.type").isEqualTo(ApiExceptionHandler.PROBLEM_BASE + "forbidden");
+        verify(service, never()).create(any());
+    }
+
+    @Test
+    @WithMockUser(roles = "CUSTOMER")
+    void delete_asCustomer_returns403() {
+        assertThat(mvc.delete().uri("/api/products/7")).hasStatus(HttpStatus.FORBIDDEN);
     }
 
     private MvcTestResult post(String json) {

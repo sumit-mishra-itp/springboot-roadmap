@@ -9,12 +9,19 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 
+import dev.roadmap.shop.auth.SecurityConfig;
+
+/** Runs with the real SecurityConfig. Class-level ADMIN, since catalog writes are admin-only (security cases: ProductControllerTest). */
 @WebMvcTest(CategoryController.class)
+@Import(SecurityConfig.class)
+@WithMockUser(roles = "ADMIN")
 class CategoryControllerTest {
 
     @Autowired

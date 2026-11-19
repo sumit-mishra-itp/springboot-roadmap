@@ -22,6 +22,8 @@ import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
+import dev.roadmap.shop.catalog.InsufficientStockException;
+
 /**
  * The ONE place errors become RFC 9457 ProblemDetail (application/problem+json). Extending
  * ResponseEntityExceptionHandler covers every Spring MVC exception (bad JSON, 405, 415, ...). The handlers below add
@@ -55,6 +57,19 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(OptimisticLockingFailureException.class)
     ProblemDetail concurrentUpdate(OptimisticLockingFailureException ex) {
         return problem(HttpStatus.CONFLICT, "concurrent-update", "Concurrent update", "The resource was modified by another request. Re-read it and retry.");
+    }
+
+    /**
+     * Not enough stock for the order. A different slug from concurrent-update on purpose: retrying this one is
+     * pointless, while a concurrent-update is worth one retry.
+     */
+    @ExceptionHandler(InsufficientStockException.class)
+    ProblemDetail insufficientStock(InsufficientStockException ex) {
+        ProblemDetail problem = problem(HttpStatus.CONFLICT, "insufficient-stock", "Insufficient stock", ex.getMessage());
+        problem.setProperty("productId", ex.getProductId());
+        problem.setProperty("requested", ex.getRequested());
+        problem.setProperty("available", ex.getAvailable());
+        return problem;
     }
 
     /** ?sort=bogus: Spring Data cannot resolve the property on the entity. A client error, not a 500. */
