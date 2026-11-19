@@ -57,7 +57,7 @@ projects/   two capstone projects (resume-grade)
 ## Phase C — AWS
 
 - [x] 16 AWS with Spring: S3, SQS, SNS, Secrets Manager, Parameter Store, RDS, LocalStack (lab `16-aws-localstack`)
-- [ ] 17 Deploy to AWS: ECR, ECS Fargate, RDS, CloudWatch. Optional, and it costs money. Every note has a teardown checklist.
+- [x] 17 Deploy to AWS: ECR, ECS Fargate, RDS, CloudWatch. Optional, and it costs money. Every note has a teardown checklist.
 
 ---
 

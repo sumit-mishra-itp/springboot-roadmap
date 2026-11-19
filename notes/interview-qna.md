@@ -1944,3 +1944,107 @@ Use two pools (writer, reader) behind `LazyConnectionDataSourceProxy` with a rea
 </details>
 
 
+
+## 17 Deploy to AWS (optional)
+
+_From [notes/17-aws-deploy/aws-deploy.md](17-aws-deploy/aws-deploy.md)_
+
+
+<details><summary>Q1. Walk me through a production deployment of a Spring Boot API on AWS ECS Fargate.</summary>
+
+Route 53 aliases the domain to an internet-facing ALB in two public subnets. The ALB terminates TLS with an ACM certificate and forwards to an `ip`-type target group. An ECS service runs at least two Fargate tasks from a task definition across two AZs in private subnets. Each task gets its own ENI (`awsvpc`). The app reaches RDS Postgres (Multi-AZ) and ElastiCache in isolated subnets. Security groups chain ALB → app → DB/cache by referencing each other. Egress for image pulls, logs and secrets goes through a NAT gateway or VPC endpoints, with the free S3 gateway endpoint always added. Images live in ECR with immutable SHA tags. Secrets are injected from Secrets Manager by the execution role, logs go to CloudWatch via `awslogs`, and traces go through an ADOT sidecar to X-Ray. Deploys are rolling with the circuit breaker, driven by GitHub Actions using OIDC. Everything is defined in CDK or Terraform.
+</details>
+
+<details><summary>Q2. What is the difference between the ECS task execution role and the task role?</summary>
+
+The **execution role** is used by the ECS/Fargate agent to *start* the task: pull the image from ECR, fetch values for the `secrets` block from Secrets Manager or SSM, and create log streams and send `awslogs` output. The **task role** is assumed by your *application code*. The SDK default credential chain reads it from the container credentials endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`) and gets short-lived, auto-refreshed credentials for S3, SQS and so on. A start failure such as `CannotPullContainerError` or "unable to pull secrets" points at the execution role. A runtime `AccessDeniedException` points at the task role. Whoever registers the task definition also needs `iam:PassRole` on both.
+</details>
+
+<details><summary>Q3. How do ALB health checks map onto Spring Boot's liveness and readiness?</summary>
+
+On ECS one mechanism plays both roles. The ALB stops routing to a target that fails the health check (readiness), and the ECS service *replaces* tasks the ELB reports unhealthy (liveness). So point the target group at the readiness endpoint: `/readyz` on the traffic port with `management.endpoint.health.probes.add-additional-paths=true`, or `/actuator/health/readiness`. Keep it free of shared dependencies such as the database, otherwise one RDS failover fails every task and ECS replaces the whole fleet. Use the service's `healthCheckGracePeriodSeconds` as the startup probe, so a slow JVM start isn't killed. A container `healthCheck` is optional and needs `curl` in the image.
+</details>
+
+<details><summary>Q4. How do ECS deregistration delay, stopTimeout and Spring's graceful shutdown interact?</summary>
+
+ECS processes a task stop sequentially. It deregisters the task from the target group, and the ALB stops sending new requests while in-flight ones finish, for up to `deregistration_delay.timeout_seconds` (default 300). ECS waits for the target to reach `UNUSED`, then sends `SIGTERM`, then `SIGKILL` after the container's `stopTimeout` (default 30 s, max 120 s on Fargate). Spring on `SIGTERM` flips readiness to refusing, stops accepting, and drains for up to `spring.lifecycle.timeout-per-shutdown-phase` (30 s). Practical settings:
+- deregistration delay ≈ longest request plus a margin (e.g. 30 s), so deploys aren't 5 minutes per batch;
+- `stopTimeout` above Boot's phase timeout (e.g. 60 s), because 30 = 30 races `SIGKILL`;
+- exec-form `ENTRYPOINT`, so Java actually receives `SIGTERM`.
+
+Unlike Kubernetes, no `preStop` sleep is needed, because the deregistration delay already happens before the signal.
+</details>
+
+<details><summary>Q5. What does the ECS deployment circuit breaker do, and how is its threshold calculated?</summary>
+
+It stops a rolling deployment from retrying a broken revision forever. Stage 1 counts tasks that never reach `RUNNING`. Stage 2, once one task is running, counts tasks replaced for failing ELB, Cloud Map or container health checks. The default threshold (`BOUNDED_PERCENT`, value 50) is 50% of the desired count, rounded up and clamped to a minimum of 3 and a maximum of 200. With `resetOnHealthyTask=true` (the default) only consecutive failures count. When the threshold is reached, the deployment is `FAILED`. With `rollback: true`, ECS redeploys the last `COMPLETED` deployment and emits `SERVICE_DEPLOYMENT_FAILED` to EventBridge. It works only with the rolling (`ECS`) deployment controller. Add CloudWatch-alarm rollback to also catch "healthy but returning errors".
+</details>
+
+<details><summary>Q6. Rolling vs blue/green on ECS: how do they work and when do you use each?</summary>
+
+**Rolling** (the ECS controller) replaces tasks gradually within `minimumHealthyPercent`/`maximumPercent`, gated by ALB health checks, with the circuit breaker and alarm rollback as safety nets. It's cheap, but a bad version reaches all users progressively, and rollback is another deployment. **Blue/green** stands up the full new task set behind a second target group, optionally tests it on a test listener, then shifts production traffic all at once, as a canary, or linearly. Rollback is an instant listener switch back to blue, which stays alive during a bake or wait period. Historically this needed CodeDeploy (`CODE_DEPLOY` controller, `appspec.yaml`, Lambda lifecycle hooks). Since July 2025 ECS supports blue/green natively, and later linear and canary. Use blue/green for high-risk or high-traffic releases where instant rollback is worth double capacity during the switch.
+</details>
+
+<details><summary>Q7. How does GitHub Actions deploy to AWS without storing access keys?</summary>
+
+Through OIDC federation. You register GitHub's issuer (`token.actions.githubusercontent.com`, audience `sts.amazonaws.com`) as an IAM OIDC identity provider, and create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` only when the token's `sub` matches, e.g. `repo:acme/orders:environment:production`. The workflow needs `permissions: id-token: write`. `aws-actions/configure-aws-credentials` exchanges the GitHub-signed JWT for temporary credentials (about an hour). Nothing secret lives in GitHub. The risks are in the conditions: a wildcard `sub` lets any branch or PR deploy, and a missing `sub` would let any repo assume the role. Pair it with a protected GitHub environment and a least-privilege policy: ECR push to one repo, register task definitions, update one service, `iam:PassRole` on two roles.
+</details>
+
+<details><summary>Q8. NAT gateway vs VPC endpoints: which do Fargate tasks in private subnets need, and what are the cost implications?</summary>
+
+Before your code runs, Fargate must reach ECR (API and dkr), S3 (image layers), CloudWatch Logs, and Secrets Manager/SSM for injected secrets. A NAT gateway provides that, plus general internet egress. It costs about $0.045/hour plus about $0.045/GB processed (approximate, check the AWS pricing page), often once per AZ. VPC endpoints provide private access to specific AWS services only. The S3 **gateway** endpoint is free and should always exist, because it removes per-GB NAT charges on image pulls. **Interface** endpoints cost about $0.01/hour per AZ each plus per-GB (approximate, check the AWS pricing page), so five endpoints in two AZs cost more per hour than one NAT. Choose endpoints for security (no internet route) or for high AWS-bound traffic. Choose a NAT when the app also needs the internet. For cheap dev setups, use a single AZ or public-IP tasks restricted to traffic from the ALB.
+</details>
+
+<details><summary>Q9. How should a Spring app on ECS get its database password, and what happens when the secret rotates?</summary>
+
+Option 1: the ECS `secrets` block with `valueFrom` pointing at the RDS-managed Secrets Manager secret's JSON keys (`...:secret:orders/db-AbCdEf:password::`), mapped to `SPRING_DATASOURCE_USERNAME`/`PASSWORD`. Relaxed binding does the rest, and the execution role needs `GetSecretValue` (and `kms:Decrypt` for a customer-managed key). The value is resolved **once, at task start**. After a rotation, running tasks keep the old value until you force a new deployment, so pair rotation with a redeploy, or keep the old credentials valid long enough. Option 2: Spring reads Secrets Manager itself (`spring.config.import=aws-secretsmanager:` with Spring Cloud AWS, using the task role) and reacts to rotation in-process. Option 3: RDS IAM authentication, with no password at all. Never put the secret in `application.yml`, a plain `environment` entry, or logs, and keep `/actuator/env` unexposed.
+</details>
+
+<details><summary>Q10. ECS Fargate vs EKS vs Lambda vs Elastic Beanstalk vs App Runner for a Spring Boot service: how do you choose?</summary>
+
+- **Fargate (ECS):** the default for containerised services without Kubernetes. No servers, per-second billing, a deep integration with ALB, IAM and CloudWatch.
+- **ECS Express Mode:** the one-call shortcut that creates the same resources. It is AWS's recommended replacement for **App Runner**, which is closed to new customers.
+- **EKS:** when you already run Kubernetes or need its ecosystem, at the cost of a control-plane fee and K8s skills.
+- **Lambda with SnapStart** and `aws-serverless-java-container` 3.x for Boot 4: spiky or event-driven workloads that benefit from scale-to-zero, but watch connection pooling, the 15-minute limit, and cost at sustained load.
+- **Elastic Beanstalk:** a jar-upload PaaS on EC2 that suits legacy apps.
+- **Plain EC2 or ECS on EC2:** wins on cost for big steady fleets, or when you need OS control.
+</details>
+
+<details><summary>Q11. Which AWS resources silently cost money in a "small" learning deployment, and how do you protect yourself?</summary>
+
+- NAT gateways (hourly, per AZ, plus per GB);
+- public IPv4 addresses (every ALB node, NAT EIP, public task IP or idle Elastic IP);
+- ALB hours (an ALB can't be stopped);
+- interface endpoints (per AZ, per hour);
+- Multi-AZ RDS (double), and stopped RDS instances that restart after 7 days;
+- snapshots and backups;
+- CloudWatch log groups with the default "Never expire" retention;
+- high-cardinality custom metrics;
+- Secrets Manager secrets and KMS keys;
+- Route 53 zones.
+
+Protection, in order:
+1. a budget with actual and forecast alerts, plus a billing alarm in us-east-1, before creating anything;
+2. tag everything and build everything with IaC;
+3. scale-to-zero schedules for dev;
+4. a teardown routine that destroys the stacks, sweeps retained resources (snapshots, ECR, S3, log groups, CDKToolkit), and verifies with Tag Editor across all regions and with Cost Explorer daily by service 24–48 hours later.
+
+Remember that accounts created since July 2025 get credits for up to 6 months, not a 12-month free tier.
+</details>
+
+<details><summary>Q12. How do you get traces and metrics from a Spring Boot 4 app on ECS into AWS's observability stack?</summary>
+
+Logs: Boot structured JSON on stdout → `awslogs` driver → CloudWatch Logs (set retention) → Logs Insights. Or use FireLens/Fluent Bit to route elsewhere. Traces: the X-Ray SDK and daemon are in maintenance mode (end of support 2027-02-25), so use `spring-boot-starter-opentelemetry` to export OTLP to an ADOT collector sidecar on `localhost:4318`, which exports to X-Ray using the task role. Metrics: the built-in ALB/ECS/RDS metrics, plus app metrics either through the ADOT collector as EMF, via Amazon Managed Prometheus, or with `micrometer-registry-cloudwatch2`. With the registry, control tag cardinality, because each dimension combination is a billed custom metric. Alarms on target 5xx rate, p99 latency, unhealthy hosts and RDS storage go to SNS and drive deployment rollback.
+</details>
+
+<details><summary>Q13. CDK vs Terraform vs CloudFormation for deploying this stack?</summary>
+
+All three describe the same resources. **CloudFormation** is AWS's native engine: YAML/JSON, AWS-managed state, automatic rollback of failed updates, but verbose. **CDK** synthesises CloudFormation from a real language (Java here). L3 patterns like `ApplicationLoadBalancedFargateService` create the ALB, service, task definition and security groups in a few lines, and you can unit-test templates. Its defaults (such as `RETAIN` policies) need care at teardown. **Terraform** uses HCL with a self-managed state file, covers every cloud and SaaS provider, and is very common in industry. It has no automatic rollback, and you must protect the state, which can contain secrets. In every case, decide who owns the task-definition revision: IaC or the CI pipeline. Terraform's `ignore_changes = [task_definition]` is the usual truce.
+</details>
+
+<details><summary>Q14. What does Spring Boot 4 do automatically when it runs on ECS?</summary>
+
+Boot 4.0 added `CloudPlatform.AWS_ECS`, detected when the `AWS_EXECUTION_ENV` variable starts with `AWS_ECS` (ECS sets it, e.g. `AWS_ECS_FARGATE`). As with other detected platforms, `isUsingForwardHeaders()` is true, so if `server.forward-headers-strategy` isn't set, Boot honours the ALB's `X-Forwarded-*` headers and builds correct `https://` URLs. You can gate beans with `@ConditionalOnCloudPlatform(CloudPlatform.AWS_ECS)` and override detection with `spring.main.cloud-platform`. Combined with Boot 4's always-on health probe groups and graceful shutdown default, the app needs very little ECS-specific config: readiness for the ALB, a keep-alive longer than the ALB idle timeout, and a container `stopTimeout` above the shutdown phase.
+</details>
+
+

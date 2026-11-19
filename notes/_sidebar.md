@@ -19,6 +19,7 @@
   - [15 Packaging & deploy](15-packaging-deploy/packaging-deploy.md)
 - **Phase C: AWS**
   - [16 AWS with Spring](16-aws/aws-spring.md)
+  - [17 Deploy to AWS](17-aws-deploy/aws-deploy.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)
