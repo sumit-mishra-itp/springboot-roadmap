@@ -1776,3 +1776,87 @@ Critical dependencies (pricing) get timeouts and idempotent retries, but no sile
 </details>
 
 
+
+## 15 Packaging & deployment
+
+_From [notes/15-packaging-deploy/packaging-deploy.md](15-packaging-deploy/packaging-deploy.md)_
+
+
+<details><summary>Q1. How does a Spring Boot fat jar run classes from jars nested inside it, when Java can't load nested jars?</summary>
+
+The manifest's `Main-Class` is Boot's `org.springframework.boot.loader.launch.JarLauncher`, not your app; your class is in `Start-Class`. `JarLauncher` registers a `nested:` URL protocol handler, reads `BOOT-INF/classpath.idx`, and creates a `LaunchedClassLoader` (a `URLClassLoader`) over URLs like `jar:nested:/app.jar/!BOOT-INF/lib/x.jar!/`. `NestedJarFile` maps each entry of each nested jar to a byte offset in the outer file, so loading a class just seeks to the right offset and inflates that entry. Nothing is unpacked. That's why nested jars must be stored uncompressed (`STORED`). Finally it sets the thread context classloader and invokes `Start-Class.main()` reflectively. Caveat: `ClassLoader.getSystemClassLoader()` can't see nested classes.
+</details>
+
+<details><summary>Q2. What are layered jars, and how do you build an efficient Docker image from one in Boot 4?</summary>
+
+The plugin writes `BOOT-INF/layers.idx`, which assigns jar content to layers ordered by change frequency: `dependencies`, `spring-boot-loader`, `snapshot-dependencies`, `application`. In a multi-stage Dockerfile you run `java -Djarmode=tools -jar app.jar extract --layers --destination extracted`, then `COPY` each layer folder separately into the runtime image, least-changing first. Docker caches layers, and a layer is reused only if all layers below it are unchanged, so a code-only change rebuilds and pushes only the small `application` layer. In Boot 4, `-Djarmode=layertools` was removed (it fails with "Unsupported jarmode"). Extracting without `--launcher` produces a plain `java -jar app.jar` + `lib/` classpath, which is also what CDS and the AOT cache need.
+</details>
+
+<details><summary>Q3. Why is setting -Xmx in a container image risky, and what do you do instead?</summary>
+
+The kernel enforces the container's memory limit on the whole process, not on the heap. Java memory is heap + metaspace + code cache + thread stacks + direct buffers + GC overhead. A fixed `-Xmx` is decoupled from the limit: when someone lowers the pod's memory, the JVM can grow past it and gets OOM-killed (exit 137) with no `OutOfMemoryError` or heap dump. Since JDK 10 the JVM is container-aware (`UseContainerSupport`), so use `-XX:MaxRAMPercentage=70–75`, which scales with whatever limit the platform sets. The default is only 25% (in a 512 MB container that's a 128 MB heap). Leave ~25% headroom for non-heap memory, and set the memory request equal to the limit.
+</details>
+
+<details><summary>Q4. Explain CDS, the Java 25 AOT cache, and Spring AOT. Which problem does each solve?</summary>
+
+CDS (Class Data Sharing) archives parsed class metadata to a `.jsa` file that the JVM memory-maps on startup, skipping class parsing and verification. On Java 21 you create it with `-XX:ArchiveClassesAtExit` during a training run (`-Dspring.context.exit=onRefresh`) and use it with `-XX:SharedArchiveFile`. The AOT cache (Project Leyden; JEP 483 in JDK 24, JEP 514/515 in JDK 25) goes further: classes are stored already loaded and linked, plus method profiles so the JIT warms up sooner. Use `-XX:AOTCacheOutput` / `-XX:AOTCache`. Both work only on the extracted jar with the same classpath and JVM build. Spring AOT is different: it runs at build time (`process-aot`) and generates Java source for bean definitions, so Spring doesn't scan, evaluate conditions or reflect at runtime. On the JVM it's enabled with `-Dspring.aot.enabled=true`, and it's mandatory for native image.
+</details>
+
+<details><summary>Q5. What are the trade-offs of GraalVM native image for a Spring Boot service, and when would you avoid it?</summary>
+
+Pros: startup in tens of milliseconds, much lower memory, a single binary, a smaller attack surface. Cons: a closed world. Reflection, resources, proxies and serialization must be declared via hints; the classpath and the bean graph are fixed at build time (`@Profile` and `@ConditionalOnProperty` are evaluated during the build); there's no JIT, so peak throughput is usually lower; builds take minutes and GBs of RAM; Java agents and some libraries don't work; debugging tools are weaker. Boot 4 needs GraalVM 25+. Avoid it for long-running, throughput-bound services, apps that rely on dynamic features or agents, and teams without native test coverage. Use it for scale-to-zero functions, CLIs and memory-bound fleets.
+</details>
+
+<details><summary>Q6. How do you tell Spring AOT and GraalVM about reflection your code does?</summary>
+
+Implement `RuntimeHintsRegistrar` and register it with `@ImportRuntimeHints` on a configuration class. In `registerHints`, call `hints.reflection().registerType(X.class)` (in Framework 7, a type hint implies member introspection; most `MemberCategory` values are deprecated), `hints.resources().registerPattern("rules/**/*.json")` (glob syntax since Framework 7), and the proxy and serialization registries as needed. For DTOs you bind manually, use `@RegisterReflectionForBinding`. Spring AOT writes all hints into `META-INF/native-image/<group>/<artifact>/reachability-metadata.json`. Test hints with `RuntimeHintsPredicates` in a plain unit test, and run `-PnativeTest` in CI.
+</details>
+
+<details><summary>Q7. Buildpacks vs a hand-written Dockerfile?</summary>
+
+`./mvnw spring-boot:build-image` uses Cloud Native Buildpacks (default builder `paketobuildpacks/builder-noble-java-tiny`) to produce an OCI image with no Dockerfile. It installs the right JRE, uses `layers.idx`, runs as non-root, adds a memory calculator and an SBOM, and supports `pack rebase` to patch the OS layer without a rebuild. You configure it with `BP_*` env vars (e.g. `BP_JVM_AOTCACHE_ENABLED=true` on Java 25). A Dockerfile gives full control (base image, OS packages, custom layout, CDS on Java 21) at the cost of maintaining it, patching the base image and doing security hardening yourself. Choose buildpacks for standard services and platform consistency, and a Dockerfile when you need control.
+</details>
+
+<details><summary>Q8. Walk through what happens when Kubernetes terminates a Spring Boot pod, and how you avoid dropped requests.</summary>
+
+Kubernetes marks the pod Terminating and, in parallel, removes it from the Service endpoints (proxies learn this asynchronously) and runs the `preStop` hook, then sends `SIGTERM`. Boot then publishes `ReadinessState.REFUSING_TRAFFIC`, the web server stops accepting new connections ("Commencing graceful shutdown"), in-flight requests drain for up to `spring.lifecycle.timeout-per-shutdown-phase` (30 s default), and the context closes. If the process is still alive after `terminationGracePeriodSeconds` (30 s default, counted from the start of `preStop`), it's `SIGKILL`ed. To avoid dropped requests: add a `preStop` sleep (5–10 s) so proxies converge before the app stops accepting; use exec-form `ENTRYPOINT` so Java receives `SIGTERM`; and set the grace period ≥ preStop + drain timeout + margin.
+</details>
+
+<details><summary>Q9. Liveness vs readiness vs startup probe: what goes in each?</summary>
+
+Liveness answers "is this process broken beyond repair?" Failing it restarts the container, so it should reflect only internal state (`livenessState`), never the DB or downstream services, or one dependency blip restarts the whole fleet. Readiness answers "should this pod get traffic right now?" Failing it removes the pod from Service endpoints without a restart; it covers warm-up, shutdown (Boot flips it on `SIGTERM`) and per-pod issues. A startup probe protects slow-starting JVMs: liveness and readiness don't run until it passes, so give it a generous failure budget. In Boot 4 the `/actuator/health/liveness` and `/readiness` groups are on by default, and `add-additional-paths=true` serves `/livez` and `/readyz` on the main port, so probes test the same connector users hit.
+</details>
+
+<details><summary>Q10. How would you set up CI for a monorepo with several Spring Boot services?</summary>
+
+One workflow whose first job computes changed projects with a path filter (e.g. `dorny/paths-filter`), then a matrix job per changed project: `actions/setup-java` with `cache: maven` and `cache-dependency-path` on that project's pom, `./mvnw -B verify` (Testcontainers works because Docker is preinstalled on `ubuntu-latest` runners), then on `main` a buildx build with GHA layer caching that pushes an image tagged with the commit SHA. Include shared files (parent poms, shared libraries, the workflow itself) in every relevant filter. Use an always-running summary job as the required check, because a workflow skipped by `on.push.paths` leaves required checks pending. CD (Argo CD/Flux) then promotes the same SHA through environments.
+</details>
+
+<details><summary>Q11. Rolling update vs blue/green vs canary: when would you choose each?</summary>
+
+Rolling (the Deployment default) replaces pods gradually, controlled by `maxSurge`/`maxUnavailable` and gated by readiness. It's free and fine for most services, but a bad version reaches everyone as the rollout proceeds, and rollback is another rollout. Blue/green runs two full environments and flips the Service selector or LB at once. Rollback is instant and you can smoke-test green first, but it needs 2× capacity and everyone switches at once. Canary sends a small percentage of real traffic to the new version and promotes or aborts automatically based on metrics (Argo Rollouts, Flagger, a mesh). It has the smallest blast radius but needs traffic-splitting infra and good SLO metrics. All three require backward-compatible DB changes, because versions overlap.
+</details>
+
+<details><summary>Q12. What does spring-boot-docker-compose do, and how is it different from Testcontainers?</summary>
+
+With `spring-boot-docker-compose` on the classpath (marked optional, so Boot 4 keeps it out of the uber jar), `DockerComposeLifecycleManager` runs `docker compose up` on startup for the project's `compose.yaml`, waits for each container's mapped port to accept TCP, and registers `ConnectionDetails` beans matched on image names, so `DataSource` and Redis wire themselves without URLs. It stops containers on exit (`lifecycle-management`), and it's skipped in tests by default. Testcontainers manages containers from Java code: `@ServiceConnection` beans in tests, or at dev time via `SpringApplication.from(App::main).with(Containers.class)` and `spring-boot:test-run`. Compose suits teams with a shared `compose.yaml`; Testcontainers reuses the same container definitions as the integration tests.
+</details>
+
+<details><summary>Q13. How do the twelve-factor principles map onto a Boot + Kubernetes deployment?</summary>
+
+Config (III) lives in the environment: ConfigMaps/Secrets become env vars or `configtree:` files bound to `@ConfigurationProperties`. Build/release/run (V): CI builds one SHA-tagged image, and releases combine it with environment config. Processes (VI): stateless pods, no local session or files. Port binding (VII): embedded Tomcat behind a Service. Concurrency (VIII): HPA adds pods. Disposability (IX): fast startup (CDS/AOT cache/native) and graceful shutdown with preStop. Dev/prod parity (X): the same image everywhere, plus Compose/Testcontainers with real Postgres. Logs (XI): JSON to stdout. Admin processes (XII): Flyway or batch jobs as Kubernetes Jobs with the same image.
+</details>
+
+<details><summary>Q14. Your Spring service was fine on a VM but is slow to start and gets killed on Kubernetes. What do you check?</summary>
+
+1. The CPU limit: startup is CPU-bound (JIT, class loading), and a 500m limit throttles it heavily. Raise it or remove the CPU limit and keep a request.
+2. Probes: without a `startupProbe`, the liveness probe kills the JVM before it's ready (`CrashLoopBackOff` with liveness failures in events).
+3. Memory: a heap from a fixed `-Xmx`, or the 25% default, versus the limit. Look for exit code 137 in `kubectl describe`.
+4. Below 2 CPUs or ~1.8 GB, ergonomics picks SerialGC.
+5. Startup acceleration: extracted jar + CDS (21) or AOT cache (25), and Spring AOT.
+6. Beans doing remote I/O in constructors.
+
+Check `/actuator/startup` with `BufferingApplicationStartup` to find slow beans.
+</details>
+
+

@@ -16,6 +16,9 @@
   - [12 Async, scheduling & Batch](12-async-batch/async-scheduling-batch.md)
   - [13 Reactive: WebFlux & R2DBC](13-reactive/webflux.md)
   - [14 Microservices & Spring Cloud](14-microservices/spring-cloud.md)
+  - [15 Packaging & deploy](15-packaging-deploy/packaging-deploy.md)
+- **Phase C: AWS**
+  - [16 AWS with Spring](16-aws/aws-spring.md)
 - **Reference**
   - [Interview Q&A bank](interview-qna.md)
   - [Note template](_template.md)
